@@ -4,6 +4,7 @@ from torch.distributions import Normal, Independent
 from .layers import (
     SimpleVAEEncoder,
     SimpleVAEDecoder,
+    GaussianProcess
 )
 
 class BackboneGP_VAE(nn.Module):
@@ -45,6 +46,14 @@ class BackboneGP_VAE(nn.Module):
         self.decoder = SimpleVAEDecoder(latent_dim, input_dim, decoder_sizes)
         self.M = M
         self.K = K
+
+        self.gp = GaussianProcess(
+            time_length=time_length,
+            latent_dim=latent_dim,
+            kernel='rbf',  # or any other kernel you prefer
+            quantile=0.5   # Adjust quantile as needed
+        )
+
 
     def encode(self, x):
         return self.encoder(x)
