@@ -140,6 +140,99 @@ def make_cnn(input_size, output_size, hidden_sizes, kernel_size=3):
     layers.append(nn.Linear(hidden_sizes[-1], output_size))
     return nn.Sequential(*layers)
 
+def make_fc(input_size, output_size, hidden_sizes):
+    """
+    Make a fully connected network that takes all the time steps independently
+    """
+    layers = []
+
+    # First fully connected layer
+    layers.extend([nn.Linear(input_size, hidden_sizes[0]), nn.ReLU()])
+
+    # Add additional hidden layers
+    for i, h in zip(hidden_sizes[:-1], hidden_sizes[1:]):
+        layers.extend([nn.Linear(i, h), nn.ReLU()])
+
+    # Handle output layers
+    if isinstance(output_size, tuple):
+        net = nn.Sequential(*layers)
+        return [net] + [nn.Linear(hidden_sizes[-1], o) for o in output_size]
+
+    layers.append(nn.Linear(hidden_sizes[-1], output_size))
+    return nn.Sequential(*layers)
+
+class GpvaeEncoder(nn.Module):
+    def __init__(self, input_size, z_size, hidden_sizes=(128, 128)):
+        super().__init__()
+        self.z_size = int(z_size)
+        self.input_size = input_size
+        self.net, self.mu_layer, self.logvar_layer = make_fc(
+            input_size, (z_size, z_size), hidden_sizes
+        )
+
+    def forward(self, x):
+        batch_size, time_length, input_size = x.size()
+        #print(f"Input shape: {x.size()}")  # Debug
+
+        # Reshape input to [batch_size * time_length, input_size]
+        x_reshaped = x.view(batch_size * time_length, input_size)
+        #print(f"Reshaped input: {x_reshaped.size()}")  # Debug
+
+        # Pass through the fully connected network
+        mapped = self.net(x_reshaped)
+        #print(f"Mapped output: {mapped.size()}")  # Debug
+
+        # Compute mean and log variance
+        mu = self.mu_layer(mapped)
+        logvar = self.logvar_layer(mapped)
+        #print(f"Mu shape: {mu.size()}")       # Should be [batch_size * time_length, z_size]
+        #print(f"Logvar shape: {logvar.size()}")  # Should be [batch_size * time_length, z_size]
+
+        # Compute standard deviation
+        std = torch.exp(0.5 * logvar)
+        #print(f"Std shape before reshape: {std.size()}")  # Should be [batch_size * time_length, z_size]
+
+        # Reshape tensors back to [batch_size, time_length, z_size]
+        mu = mu.view(batch_size, time_length, self.z_size)
+        std = std.view(batch_size, time_length, self.z_size)
+        #print(f"Mu shape after reshape: {mu.size()}")     # [batch_size, time_length, z_size]
+        #print(f"Std shape after reshape: {std.size()}")   # [batch_size, time_length, z_size]
+
+        # Create Normal distribution
+        z_dist = torch.distributions.Normal(loc=mu, scale=std)
+        # Make it an Independent distribution over the last dimension (latent dimension)
+        z_dist = torch.distributions.Independent(z_dist, 1)
+
+        assert not torch.isnan(mu).any(), print(mu)
+        assert not torch.isnan(std).any(), print(std)
+
+        return z_dist
+
+
+
+class GpvaeDecoder(nn.Module):
+    def __init__(self, input_size, output_size, hidden_sizes=(256, 256)):
+        """This module is a decoder with Gaussian output distribution.
+
+        Parameters
+        ----------
+        output_size : int,
+            the feature dimension of the output
+
+        hidden_sizes: tuple
+            the tuple of hidden layer sizes, and the tuple length sets the number of hidden layers.
+        """
+        super().__init__()
+        self.net = make_nn(input_size, output_size, hidden_sizes)
+
+    def forward(self, x):
+        mu = self.net(x)
+        var = torch.ones_like(mu)#.type(torch.float)#*.1
+        return torch.distributions.Normal(mu, var)
+
+
+
+
 
 class SimpleVAEEncoder(nn.Module):
     def __init__(self, input_size, z_size, hidden_sizes=(128, 128)):
@@ -286,7 +379,7 @@ class GaussianProcess(nn.Module):
         quantile : float
             The quantile threshold for variance to select observations.
         """
-        super(GaussianProcess, self).__init__()
+        super().__init__() #GaussianProcess, self
         self.time_length = time_length
         self.latent_dim = latent_dim
         self.kernel_type = kernel

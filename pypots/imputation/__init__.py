@@ -38,6 +38,7 @@ from .stemgnn import StemGNN
 from .imputeformer import ImputeFormer
 from .timemixer import TimeMixer
 from .moderntcn import ModernTCN
+from .gp_ae import GP_VAE
 
 # naive imputation methods
 from .locf import LOCF
@@ -80,6 +81,7 @@ __all__ = [
     "ImputeFormer",
     "TimeMixer",
     "ModernTCN",
+    "GP_VAE",
     # naive imputation methods
     "LOCF",
     "Mean",

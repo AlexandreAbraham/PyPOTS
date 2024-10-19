@@ -371,10 +371,13 @@ class GP_VAE(BaseNNImputer):
                 num_workers=self.num_workers,
             )
 
-        # Step 2: train the model and freeze it
+        # Step 2: train the AE model and freeze it
         self._train_model(training_loader, val_loader)
         self.model.load_state_dict(self.best_model_dict)
         self.model.eval()  # set the model as eval status to freeze it.
+
+        # Step 2bis: learn the kernel
+        #self._fit_kernel(training_loader, val_loader)
 
         # Step 3: save the model if necessary
         self._auto_save_model_if_necessary(confirm_saving=self.model_saving_strategy == "best")
@@ -426,8 +429,13 @@ class GP_VAE(BaseNNImputer):
         with torch.no_grad():
             for idx, data in enumerate(test_loader):
                 inputs = self._assemble_input_for_testing(data)
-                results = self.model.forward(inputs, training=False, n_sampling_times=n_sampling_times)
-                imputed_data = results["imputed_data"]
+                #results = self.model.forward(inputs, training=False, n_sampling_times=n_sampling_times)
+                #imputed_data = results["imputed_data"]
+
+                # embed data in latent space
+                embedding = self.model.encode(inputs, training-False, n_sampling_times=n_sampling_times)
+                # correct with gaussian process
+                imputed_data = self.gp.infer(embedding)
                 imputation_collector.append(imputed_data)
 
         imputation = torch.cat(imputation_collector).cpu().detach().numpy()
