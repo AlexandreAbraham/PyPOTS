@@ -29,8 +29,233 @@ from ...optim.base import Optimizer
 from ...utils.logging import logger
 from ...utils.metrics import calc_mse
 
-class GP():
-    """The Gaussian Procees class"""
+# for probabilistic GP
+import torch.nn.functional as F
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
+
+import matplotlib.pyplot as plt
+
+class ProbabilisticGP:
+    """
+    A sub-module of a VAE that corrects the latent time-seties via the Probabilistic GP regression scheme
+    """
+    def __init__(self):
+        self.encoder = None # this should be a neural network
+        self.kernel = None
+        self.enforce_variance_bias = False
+        self.kernel_params = {}
+
+    def correct_embedding_with_gp(self, z_mu, z_sigma):
+        """
+        Correct the latent embeddings using Gaussian Process regression.
+
+        Args:
+            z_mu (Tensor): Mean of the latent variables.
+            z_sigma (Tensor): Standard deviation of the latent variables.
+
+        Returns:
+            Tensor: Corrected latent variables.
+        """
+        if self.kernel is None:
+            self.fit_gp_kernels(z_mu.detach(), z_sigma.detach())
+
+        n_samples, n_dims = z_mu.shape
+        z_corrected = torch.zeros_like(z_mu)
+
+        x = torch.arange(n_samples).reshape(-1, 1)
+        v = z_sigma.clone()
+
+        # Enforce variance bias adjustment
+        if self.enforce_variance_bias:
+            v = self.adjust_variances(v)
+
+        a,b,temp = self.set_kernel(z_mu)
+
+        for j in range(n_dims):
+            self.kernel[j].fit(x, z_mu[:,j], temp*v[:,j])
+            z_corrected[:,j], var_corrected = self.kernel[j].predict() #predict(x)
+
+        return z_corrected
+
+    def adjust_variances(self, v, window_size=4):
+            """
+            Adjusts variances by enforcing variance bias based on local variance patterns.
+
+            Args:
+                v (torch.Tensor): Variance tensor to adjust.
+                window_size (int): Number of elements to include on each side for local averaging.
+
+            Returns:
+                torch.Tensor: Adjusted variance tensor.
+            """
+            kernel_size = 2 * window_size + 1
+            kernel = torch.ones(kernel_size, device=v.device)
+            kernel[window_size] = 0  # Exclude the current element
+            kernel /= (kernel_size - 1)
+
+            # Pad the variance tensor
+            v_padded = F.pad(v.unsqueeze(0).unsqueeze(0), (window_size, window_size), mode='reflect')
+
+            # Compute local mean variances
+            local_means = F.conv1d(v_padded, kernel.view(1, 1, -1))[0, 0]
+
+            # Calculate variance differences
+            v_diff = (local_means - v).clamp(-1e3, 1e3)
+            v_diff_std = v_diff.std()
+
+            # Avoid division by zero
+            if v_diff_std == 0:
+                added_variance_bias = torch.ones_like(v_diff)
+            else:
+                added_variance_bias = torch.max(torch.tensor(1.0, device=v.device), v_diff / v_diff_std)
+
+            # Apply the adjustment
+            v_adjusted = v * added_variance_bias
+            return v_adjusted
+
+    def fit_kernel(self, z_mu_batch, z_sigma_batch, noise_ratio = 100):
+        """
+        Fit Gaussian Process kernels for each latent dimension.
+
+        Args:
+            z_mu (Tensor): Mean of the latent variables.
+            z_sigma (Tensor): Standard deviation of the latent variables.
+        """
+        batch_size, n_samples, n_dims = z_mu_batch.size()
+        self.kernel = []
+
+        for i in range(batch_size):
+
+            z_mu, z_sigma = z_mu_batch[i], z_sigma_batch[i] #this should be modified to deal with all elements of batch
+
+            x = np.arange(n_samples).reshape(-1, 1)
+
+            for dim in range(n_dims):
+                if dim not in self.kernel_params.keys():
+                    self.kernel_params[dim] = {'length_scale': [], 'noise': []}
+                y = z_mu[:, dim].numpy()
+                y_std = z_sigma[:, dim].numpy()
+
+                # Filter out high uncertainty points
+                quantile = np.quantile(y_std, 0.9)
+                mask = y_std < quantile
+                x_filtered = x[mask]
+                y_filtered = y[mask]
+
+                # Define kernel
+                kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=1.0, length_scale_bounds=(1e-8, 1e2))
+
+                # Define noise level
+                noise = y_filtered.std() / noise_ratio
+
+                # Instantiate GP regressor
+                gp = GaussianProcessRegressor(kernel=kernel, alpha=noise, n_restarts_optimizer=10, normalize_y=True)
+
+                # Fit the GP model to the observed data
+                gp.fit(x_filtered, y_filtered)
+
+                # Set parameters of the ProbabilisticGPRepgressor
+                length_scale = gp.kernel_.get_params()['k2__length_scale']
+                #print(length_scale, self.kernel[dim])
+                
+                self.kernel_params[dim]['length_scale'] += [length_scale]
+                self.kernel_params[dim]['noise'] += [noise]
+
+            #self.kernel.append(ProbabilisticGaussianProcessRegressor(length_scale = length_scale, noise = noise))
+
+            #print('DONE for dim ', dim)
+
+class ProbabilisticGaussianProcessRegressor: #using torch linalg solve
+    def __init__(self, length_scale=1.0, noise=1e-6):
+        self.length_scale = length_scale
+        self.noise = noise
+        #print(noise, 'noise')
+        self.compute_variance = False
+        self.alpha = 1.
+
+    def rbf_kernel(self, X1, X2):
+        """Compute the RBF kernel (Gaussian kernel)."""
+        dists = torch.cdist(X1, X2, p=2)  # Pairwise distances
+        K = torch.exp(-0.5 * (dists / self.length_scale) ** 2)
+        return K
+
+    def fit(self, X_train, y_train, variance):
+        """Fit the Gaussian Process model with training data and probabilities."""
+        # Detach X and y
+        X_train = X_train.detach().reshape(-1,1).float()
+        y_train = y_train.detach().float()
+        
+        self.X_train = X_train
+        self.y_train = y_train
+        #self.probabilities = probabilities
+
+        # Compute the kernel matrix for the training data
+        self.K_star = self.rbf_kernel(X_train, X_train)
+        
+        # Add noise term to the diagonal (regularization)
+        #self.alpha = .5
+
+        # Normalize probas
+        #self.probabilities = self.probabilities / self.probabilities.max()
+        #variance = (1 - self.probabilities)/self.probabilities
+        #variance = -1 * torch.log(self.probabilities)
+        K_regularisation = self.noise * torch.diag(variance).clone()
+        self.K = self.K_star + K_regularisation * self.alpha
+
+        self.bias = torch.sign(y_train) * variance * .05
+
+    def predict(self):
+        """Predict the mean and variance for the training points themselves."""
+        
+        # Mean prediction
+        mu_s = self.K_star @ torch.linalg.solve(self.K, self.y_train + self.bias)
+        #K_star = K_star / K_star.sum(axis=0)[None,:]
+        #mu_s = K_star @ (self.y_train * self.probabilities)
+        
+        if self.compute_variance:
+            # Compute the inverse of the kernel matrix
+            self.K_inv = torch.linalg.solve(self.K, torch.eye(self.K.size(0), device=self.K.device))
+
+            # Variance (which will be 0 for exact points)
+            K_star = self.K_star
+            K_s_s = K_star - K_star @ self.K_inv @ K_star
+            sigma_s = K_s_s.diag()
+
+            M = K_star @ self.K_inv
+            idx = M.shape[0]//2
+            plt.imshow(K_star.detach())
+            plt.title('K_star')
+            plt.show()
+            plt.imshow(M.detach())
+            plt.show()
+            plt.plot(M[idx].detach(), label = 'M')
+            plt.legend()
+            plt.show()
+            plt.plot((M[idx]*self.probabilities).detach())
+            plt.plot((M[idx//2]*self.probabilities).detach())
+            plt.show()
+            plt.legend()
+            plt.show()
+        else:
+            sigma_s = 1
+
+        
+        return mu_s, sigma_s
+
+    def set_kernel(self, z):
+
+
+        out = self.encoder.kernel_params(z.mean(axis=0).reshape(1,z.shape[1]))[0]
+
+        a = torch.abs(out[0])*10
+        b = torch.abs(out[1])*10
+        temp = torch.exp(out[2])*10
+
+        a, b = torch.tensor(1), torch.tensor(.5)
+        #temp = torch.tensor(10)
+
+        return a, b, temp
 
 class GP_VAE(BaseNNImputer):
     """The PyTorch implementation of the GPVAE model :cite:`fortuin2020gpvae`.
@@ -191,7 +416,7 @@ class GP_VAE(BaseNNImputer):
         self.optimizer.init_optimizer(self.model.parameters())
 
         # set gp
-        self.gp = GP()
+        self.gp = ProbabilisticGP()
 
     def _assemble_input_for_training(self, data: list) -> dict:
         # fetch data
@@ -379,13 +604,18 @@ class GP_VAE(BaseNNImputer):
                 num_workers=self.num_workers,
             )
 
+        # Step 2bis: learn the kernel
+        #print('fitting kernel')
+        #self._fit_kernel(training_loader)
+        
         # Step 2: train the AE model and freeze it
         self._train_model(training_loader, val_loader)
         self.model.load_state_dict(self.best_model_dict)
         self.model.eval()  # set the model as eval status to freeze it.
 
         # Step 2bis: learn the kernel
-        #self._fit_kernel(training_loader, val_loader)
+        print('fitting kernel')
+        self._fit_kernel(training_loader)
 
         # Step 3: save the model if necessary
         self._auto_save_model_if_necessary(confirm_saving=self.model_saving_strategy == "best")
@@ -481,14 +711,35 @@ class GP_VAE(BaseNNImputer):
         self,
         training_loader) -> None:
 
+
         with torch.no_grad():
+            training_step = 0
             for idx, data in enumerate(training_loader):
                 training_step += 1
                 inputs = self._assemble_input_for_training(data)
+                x = inputs['X']
 
                 # encode the data
-                qz_x = self.model.backbone.encode(inputs)   
+                qz_x = self.model.backbone.encode(x)   
                 z_mu, z_var = qz_x.mean, qz_x.variance
 
                 self.gp.fit_kernel(z_mu, z_var)
+                print('Done')
+                #if training_step > 10:
+                break
+                #break
+
+            for dim in self.gp.kernel_params.keys():
+                print(self.gp.kernel_params[dim])
+                l, n = self.gp.kernel_params[dim]['length_scale'], self.gp.kernel_params[dim]['noise']
+                plt.subplot(3,1,1)
+                plt.hist(l)
+                plt.subplot(3,1,2)
+                plt.hist(n)
+                plt.subplot(3,1,3)
+                plt.scatter(l,n, alpha = .5)
+                plt.show()
+
+
+        
 

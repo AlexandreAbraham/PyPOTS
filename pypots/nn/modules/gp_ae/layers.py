@@ -293,7 +293,7 @@ class GpvaeDecoder(nn.Module):
 
     def forward(self, x):
         mu = self.net(x) 
-        var = torch.ones_like(mu).type(torch.float)*.05
+        var = torch.ones_like(mu).type(torch.float)*.5
         return torch.distributions.Normal(mu, var)
 
 
