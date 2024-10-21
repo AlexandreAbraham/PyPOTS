@@ -167,20 +167,24 @@ class BackboneGP_VAE(nn.Module):
         plt.figure(figsize=(15, 10))
 
         losses = f'kl = {kl.mean().item()} - nll = {nll.mean().item()} - temporal {tl.item()}'
-
-        plt.subplot(2, 1, 1)
+        plt.subplot(3, 1, 1)
         for dim in range(latent_dim):
             plt.plot(range(time_steps), z_mean[:, dim], label=f'Latent dim {dim} Mean')
             plt.fill_between(range(time_steps), z_mean[:, dim] - z_var[:, dim], z_mean[:, dim] + z_var[:, dim], alpha=0.2)
+
         
         plt.title('Latent Time Series (Mean and Variance) ' + losses)
         plt.xlabel('Time Steps')
         plt.ylabel('Latent Values')
+
+        plt.subplot(3, 1, 2)
+        nb_missing_vals = (X_np[0]==0).sum(axis=1)
+        plt.plot(nb_missing_vals,'o')
         #plt.legend()
 
         # Plot original vs reconstructed data for one feature (e.g., the first feature)
         feature_idx = 0  # Select the first feature for plotting
-        plt.subplot(2, 1, 2)
+        plt.subplot(3, 1, 3)
         plt.plot(range(time_steps), X_recon[0, :, :], label='Reconstructed Data')
         plt.gca().set_prop_cycle(None)
         plt.plot(range(time_steps), X_np[0, :, :], 'o', label='Data with artifically missing Data')
@@ -204,7 +208,7 @@ class BackboneGP_VAE(nn.Module):
         X_ori = X.repeat(self.K * self.M, 1, 1)
         missing_mask_ori = missing_mask.repeat(self.K * self.M, 1, 1).type(torch.bool)
 
-        X = mcar(X_ori, p=.2)
+        X = mcar(X_ori, p=.3)
         X, missing_mask = fill_and_get_mask_torch(X)
         missing_mask = (X != 0).type(torch.bool)
 
@@ -218,11 +222,11 @@ class BackboneGP_VAE(nn.Module):
         px_z = self.decode(z)
 
         # Negative log-likelihood (reconstruction loss)
-        nll = -px_z.log_prob(X)
-        nll = torch.where(torch.isfinite(nll), nll, torch.zeros_like(nll))
+        nll_recon = -px_z.log_prob(X)
+        nll_recon = torch.where(torch.isfinite(nll_recon), nll_recon, torch.zeros_like(nll_recon))
         if missing_mask is not None:
-            nll = torch.where(missing_mask, nll, torch.zeros_like(nll))
-        nll = nll.sum(dim=(1, 2))
+            nll_recon = torch.where(missing_mask, nll_recon, torch.zeros_like(nll_recon))
+        nll_recon = nll_recon.sum(dim=(1, 2))
 
         # Negative log-likelihood (reconstruction loss) for imputation
         nll_imputation = -px_z.log_prob(X_ori)
@@ -232,18 +236,23 @@ class BackboneGP_VAE(nn.Module):
         nll_imputation = nll_imputation.sum(dim=(1, 2))
 
         # get final nll
-        alpha = .2
+        alpha = self.temperature * .5
+        alpha = .1
         #nll = (nll + nll_imputation) / 2
-        nll = nll*(1-alpha) + nll_imputation*alpha
+        nll = nll_recon * (1 - alpha) + nll_imputation * alpha
+        #nll = .1 * nll
 
         # Compute the number of missing values per sample per time step
         missing_ratio = missing_mask.float().mean(dim=2)  # Shape: (batch_size * K * M, time_steps)
 
         # Avoid zero variance by adding a small epsilon
-        epsilon = 1e-6
+        epsilon = 1e-3
         prior_scale = (1 - missing_ratio).pow(0.5).unsqueeze(-1) + epsilon  # Shape: (batch_size * K * M, time_steps, 1)
+        if prior_scale.min() < .4:
+            print(prior_scale.min(), prior_scale.max())
         prior_scale = prior_scale.expand(-1, -1, self.latent_dim)  # Expand to latent_dim
         prior_loc = torch.zeros_like(prior_scale)  # Zero mean
+        prior_loc = qz_x.mean.detach()
 
         # Create prior distribution with adjusted variance
         prior = Independent(Normal(prior_loc, prior_scale), 1)  # Independent over latent dimensions
@@ -267,16 +276,27 @@ class BackboneGP_VAE(nn.Module):
             elbo = -nll - self.beta * kl
             elbo = elbo.mean()
 
+        #print(qz_x.variance)
         ## add temporal loss
-        temporal_loss = (z[:,1:] - z[:,:-1]).pow(2).mean()
-        elbo = elbo - temporal_loss
+        temporal_loss = (z[:,1:] - z[:,:-1]).abs().mean()
+        #elbo = elbo - .01*temporal_loss
 
         #print(temporal_loss)
+        if elbo > 0:
+            print((-nll - self.beta * kl).mean().item())
+            print(nll.mean().item(),kl.mean().item())
+            print(self.temperature, alpha)
+
+
+        assert not (elbo.abs() > 1e6).any(), print( 'elbo too big ', nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item(), temporal_loss.item(), qz_x.variance.mean())
+        assert not (elbo > 50), print( 'elbo negative ', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item(), temporal_loss.item(), qz_x.variance.mean())
+        assert not (torch.isnan(elbo).any()), print( 'elbo is nan ', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item(), temporal_loss.item(), qz_x.variance.mean())
 
 
         # Occasionally plot the latent series mean and variance and reconstruction
-        if torch.rand(1) < 0.1:
-            print('losses', nll.mean().item(), kl.mean().item(), temporal_loss.item())
+        if torch.rand(1) < 0.001:
+            #print('losses', nll.mean().item(), kl.mean().item(), temporal_loss.item())
+            #print(nll_recon.mean().item(), nll_imputation.mean().item())
             self.plot_latent_series_and_reconstruction(z, px_z, X_ori.detach(), X.detach(), self.latent_dim, time_steps, nll, kl, temporal_loss)
 
         return -elbo

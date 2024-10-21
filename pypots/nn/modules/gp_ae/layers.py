@@ -151,7 +151,7 @@ def make_fc(input_size, output_size, hidden_sizes):
 
     # Add additional hidden layers
     for i, h in zip(hidden_sizes[:-1], hidden_sizes[1:]):
-        layers.extend([nn.Linear(i, h), nn.ReLU()])
+        layers.extend([nn.Linear(i, h), nn.BatchNorm1d(h), nn.ReLU()]) # add batchnorm
 
     # Handle output layers
     if isinstance(output_size, tuple):
@@ -159,8 +159,14 @@ def make_fc(input_size, output_size, hidden_sizes):
         return [net] + [nn.Linear(hidden_sizes[-1], o) for o in output_size]
 
     layers.append(nn.Linear(hidden_sizes[-1], output_size))
-    return nn.Sequential(*layers)
+    net = nn.Sequential(*layers)
 
+    # Initialize weights using Xavier initialization
+    for m in net.modules():
+        if isinstance(m, nn.Linear):
+            torch.init.xavier_uniform_(m.weight)
+
+    return net
 class GpvaeEncoder(nn.Module):
     def __init__(self, input_size, z_size, hidden_sizes=(128, 128)):
         super().__init__()
@@ -169,6 +175,9 @@ class GpvaeEncoder(nn.Module):
         self.net, self.mu_layer, self.logvar_layer = make_fc(
             input_size, (z_size, z_size), hidden_sizes
         )
+
+
+
 
     def forward(self, x):
         batch_size, time_length, input_size = x.size()
@@ -208,6 +217,63 @@ class GpvaeEncoder(nn.Module):
 
         return z_dist
 
+class GpvaeEncoder_cnn(nn.Module):
+    def __init__(self, input_size, z_size, hidden_sizes=(128, 128), window_size=24):
+        """This module is an encoder with 1d-convolutional network and multivariate Normal posterior used by GP-VAE with
+        proposed banded covariance matrix
+
+        Parameters
+        ----------
+        input_size : int,
+            the feature dimension of the input
+
+        z_size : int,
+            the feature dimension of the output latent embedding
+
+        hidden_sizes : tuple,
+            the tuple of the hidden layer sizes, and the tuple length sets the number of hidden layers
+
+        window_size : int
+            the kernel size for the Conv1D layer
+        """
+        super().__init__()
+        self.z_size = int(z_size)
+        self.input_size = input_size
+        self.net, self.mu_layer, self.logvar_layer = make_cnn(
+            input_size, (z_size, z_size), hidden_sizes, window_size
+        )
+
+    def forward(self, x):
+        mapped = self.net(x)
+        batch_size = mapped.size(0)
+        time_length = mapped.size(1)
+
+        num_dim = len(mapped.shape)
+        mu = self.mu_layer(mapped)
+        logvar = self.logvar_layer(mapped)
+
+        #print(f"Mu shape: {mu.size()}")       # Should be [batch_size * time_length, z_size]
+        #print(f"Logvar shape: {logvar.size()}")  # Should be [batch_size * time_length, z_size]
+
+        # Compute standard deviation
+        std = torch.exp(0.5 * logvar)
+        #print(f"Std shape before reshape: {std.size()}")  # Should be [batch_size * time_length, z_size]
+
+        # Reshape tensors back to [batch_size, time_length, z_size]
+        mu = mu.view(batch_size, time_length, self.z_size)
+        std = std.view(batch_size, time_length, self.z_size)
+        #print(f"Mu shape after reshape: {mu.size()}")     # [batch_size, time_length, z_size]
+        #print(f"Std shape after reshape: {std.size()}")   # [batch_size, time_length, z_size]
+
+        # Create Normal distribution
+        z_dist = torch.distributions.Normal(loc=mu, scale=std)
+        # Make it an Independent distribution over the last dimension (latent dimension)
+        z_dist = torch.distributions.Independent(z_dist, 1)
+
+        assert not torch.isnan(mu).any(), print(mu)
+        assert not torch.isnan(std).any(), print(std)
+
+        return z_dist
 
 
 class GpvaeDecoder(nn.Module):
@@ -226,8 +292,8 @@ class GpvaeDecoder(nn.Module):
         self.net = make_nn(input_size, output_size, hidden_sizes)
 
     def forward(self, x):
-        mu = self.net(x)
-        var = torch.ones_like(mu)#.type(torch.float)#*.1
+        mu = self.net(x) 
+        var = torch.ones_like(mu).type(torch.float)*.05
         return torch.distributions.Normal(mu, var)
 
 
