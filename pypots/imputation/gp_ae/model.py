@@ -29,6 +29,8 @@ from ...optim.base import Optimizer
 from ...utils.logging import logger
 from ...utils.metrics import calc_mse
 
+class GP():
+    """The Gaussian Procees class"""
 
 class GP_VAE(BaseNNImputer):
     """The PyTorch implementation of the GPVAE model :cite:`fortuin2020gpvae`.
@@ -188,6 +190,9 @@ class GP_VAE(BaseNNImputer):
         self.optimizer = optimizer
         self.optimizer.init_optimizer(self.model.parameters())
 
+        # set gp
+        self.gp = GP()
+
     def _assemble_input_for_training(self, data: list) -> dict:
         # fetch data
         (
@@ -239,9 +244,10 @@ class GP_VAE(BaseNNImputer):
         self.best_model_dict = None
 
         try:
-            training_step = 0
+            training_step = 0.
             for epoch in range(1, self.epochs + 1):
                 self.model.train()
+                self.model.backbone.temperature = epoch / (self.epochs + 1)
                 epoch_train_loss_collector = []
                 for idx, data in enumerate(training_loader):
                     training_step += 1
@@ -250,6 +256,8 @@ class GP_VAE(BaseNNImputer):
                     results = self.model.forward(inputs)
                     # use sum() before backward() in case of multi-gpu training
                     results["loss"].sum().backward()
+                    #clip gradients
+                    #torch.nn.utils.clip_grad_norm_(v_1, max_norm=1.0, norm_type=2)
                     self.optimizer.step()
                     epoch_train_loss_collector.append(results["loss"].sum().item())
 
@@ -468,3 +476,19 @@ class GP_VAE(BaseNNImputer):
 
         results_dict = self.predict(test_set, file_type=file_type)
         return results_dict["imputation"]
+
+    def _fit_kernel(
+        self,
+        training_loader) -> None:
+
+        with torch.no_grad():
+            for idx, data in enumerate(training_loader):
+                training_step += 1
+                inputs = self._assemble_input_for_training(data)
+
+                # encode the data
+                qz_x = self.model.backbone.encode(inputs)   
+                z_mu, z_var = qz_x.mean, qz_x.variance
+
+                self.gp.fit_kernel(z_mu, z_var)
+
