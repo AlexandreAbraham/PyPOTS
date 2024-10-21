@@ -115,7 +115,7 @@ class BackboneGP_VAE(nn.Module):
     def kl_divergence(q_dist, p_dist):
         return torch.distributions.kl_divergence(q_dist, p_dist)
 
-    def plot_latent_series_and_reconstruction(self, z, px_z, X_ori, X, latent_dim, time_steps, nll, kl, tl, folder='latent_plots'):
+    def plot_latent_series_and_reconstruction(self, z, px_z, qz_x, X_ori, X, latent_dim, time_steps, nll, kl, tl, folder='latent_plots'):
         """
         Plots the mean and variance of all latent time series and the original vs reconstructed data.
 
@@ -125,6 +125,8 @@ class BackboneGP_VAE(nn.Module):
             The latent variable tensor with shape [batch_size, time_steps, latent_dim].
         px_z : torch.distributions.Normal
             The distribution for the reconstructed data.
+        qz_x : torch.distributions.Distribution
+            The posterior distribution q(z|x).
         X_ori : torch.Tensor
             The original data before any missingness is added.
         X : torch.Tensor
@@ -133,27 +135,33 @@ class BackboneGP_VAE(nn.Module):
             The dimension of the latent space.
         time_steps : int
             The number of time steps in the sequence.
+        nll : torch.Tensor
+            The negative log-likelihood.
+        kl : torch.Tensor
+            The KL divergence.
+        tl : torch.Tensor
+            The temporal loss.
         folder : str
             The folder where the plot will be saved.
         """
+
         # Convert to CPU numpy arrays for plotting
         z_mean = z.mean(dim=0).detach().cpu().numpy()  # Shape: [time_steps, latent_dim]
-        z_var = z.var(dim=0).detach().cpu().numpy()    # Shape: [time_steps, latent_dim]
+        z_mean = z[0].detach().cpu().numpy()
+        z_var = qz_x.variance[0].detach().cpu().numpy()
 
-        # Replace zeros (indicating missing data) with NaN in both original and reconstructed data
         X_ori_np = torch.clone(X_ori).detach().cpu().numpy()
         X_np = X.detach().cpu().numpy()
-        X_recon = px_z.mean.detach().cpu().numpy()  # Get the mean of the reconstructed distribution
+
+        # Sample 10 times from the posterior to get 10 reconstructions
+        reconstructions = []
+        for i in range(10):
+            z_sample = qz_x.rsample()  # Sample from the posterior
+            px_z_sample = self.decode(z_sample)  # Reconstruct the data
+            X_recon_sample = px_z_sample.mean.detach().cpu().numpy()  # Get the mean of the reconstruction
+            reconstructions.append(X_recon_sample)
 
         X_ori_np[X_ori_np == 0] = np.nan
-        #X_np[X_np == 0] = np.nan
-        #X_recon[X_recon == 0] = np.nan
-
-        # normalize everyone
-        #mu, sigma = X_recon.mean(axis=(0,1)).reshape(1,1,-1), X_recon.std(axis=(0,1)).reshape(1,1,-1)
-        #X_ori_np = (X_ori_np - mu) / sigma
-        #X_np = (X_np - mu) / sigma
-        #X_recon = (X_recon - mu) / sigma
 
         # Create directory if it doesn't exist
         if not os.path.exists(folder):
@@ -164,43 +172,45 @@ class BackboneGP_VAE(nn.Module):
         plot_path = os.path.join(folder, f'latent_series_and_reconstruction_{timestamp}.png')
 
         # Plot all latent dimensions' mean and variance
-        plt.figure(figsize=(15, 10))
+        plt.figure(figsize=(15, 12))
 
         losses = f'kl = {kl.mean().item()} - nll = {nll.mean().item()} - temporal {tl.item()}'
-        plt.subplot(3, 1, 1)
+        plt.subplot(4, 1, 1)
         for dim in range(latent_dim):
             plt.plot(range(time_steps), z_mean[:, dim], label=f'Latent dim {dim} Mean')
             plt.fill_between(range(time_steps), z_mean[:, dim] - z_var[:, dim], z_mean[:, dim] + z_var[:, dim], alpha=0.2)
 
-        
         plt.title('Latent Time Series (Mean and Variance) ' + losses)
         plt.xlabel('Time Steps')
         plt.ylabel('Latent Values')
 
-        plt.subplot(3, 1, 2)
-        nb_missing_vals = (X_np[0]==0).sum(axis=1)
-        plt.plot(nb_missing_vals,'o')
-        #plt.legend()
+        # Plot scales for prior and posterior
+        plt.subplot(4, 1, 2)
+        nb_missing_vals = (X_np[0] == 0).sum(axis=1)
+        missing_ratio = (X_np[0] != 0).mean(axis=1)
+        prior_scale = (1 - missing_ratio) ** 0.5
+        plt.plot(prior_scale, label='Prior scale')
+        plt.plot(np.linalg.norm(z_var, axis=1), label='Posterior scale')
+        plt.legend()
 
-        # Plot original vs reconstructed data for one feature (e.g., the first feature)
-        feature_idx = 0  # Select the first feature for plotting
-        plt.subplot(3, 1, 3)
-        plt.plot(range(time_steps), X_recon[0, :, :], label='Reconstructed Data')
+        # Plot original vs reconstructed data for all 10 reconstructions
+        plt.subplot(4, 1, 3)
+        for i, X_recon_sample in enumerate(reconstructions):
+            plt.plot(range(time_steps), X_recon_sample[0, :, :], label=f'Reconstructed {i+1}', alpha=0.6)
+        
         plt.gca().set_prop_cycle(None)
-        plt.plot(range(time_steps), X_np[0, :, :], 'o', label='Data with artifically missing Data')
+        plt.plot(range(time_steps), X_np[0, :, :], 'o', label='Data with missing Data')
         plt.gca().set_prop_cycle(None)
         plt.plot(range(time_steps), X_ori_np[0, :, :], '+', label='Original Data')
-        plt.title(f'Original vs Reconstructed Data (Feature {feature_idx})')
+        plt.title('Original vs Reconstructed Data (10 Samples)')
         plt.xlabel('Time Steps')
         plt.ylabel('Feature Values')
-        #plt.legend()
+        plt.legend()
 
         # Save the plot
         plt.tight_layout()
         plt.savefig(plot_path)
         plt.close()
-
-        #print(f"Plot saved at {plot_path}")
 
     # Modified forward function
     def forward(self, X, missing_mask):
@@ -236,11 +246,9 @@ class BackboneGP_VAE(nn.Module):
         nll_imputation = nll_imputation.sum(dim=(1, 2))
 
         # get final nll
-        alpha = self.temperature * .5
+        #alpha = self.temperature * .5
         alpha = .1
-        #nll = (nll + nll_imputation) / 2
         nll = nll_recon * (1 - alpha) + nll_imputation * alpha
-        #nll = .1 * nll
 
         # Compute the number of missing values per sample per time step
         missing_ratio = missing_mask.float().mean(dim=2)  # Shape: (batch_size * K * M, time_steps)
@@ -251,38 +259,28 @@ class BackboneGP_VAE(nn.Module):
         if prior_scale.min() < .4:
             print(prior_scale.min(), prior_scale.max())
         prior_scale = prior_scale.expand(-1, -1, self.latent_dim)  # Expand to latent_dim
-        prior_loc = torch.zeros_like(prior_scale)  # Zero mean
-        prior_loc = qz_x.mean.detach()
+        #prior_loc = torch.zeros_like(prior_scale)  # Zero mean
+        prior_loc = qz_x.mean.detach() #no prior on the mean
 
         # Create prior distribution with adjusted variance
         prior = Independent(Normal(prior_loc, prior_scale), 1)  # Independent over latent dimensions
 
-        # Compute KL divergence between q(z|x) and p(z)
-        if self.K > 1:
-            kl = qz_x.log_prob(z) - prior.log_prob(z)
-            kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
-            kl = kl.sum(1)
-
-            weights = -nll - kl
-            weights = torch.reshape(weights, [self.M, self.K, -1])
-
-            elbo = torch.logsumexp(weights, dim=1)
-            elbo = elbo.mean()
-        else:
-            kl = self.kl_divergence(qz_x, prior)
-            kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
-            kl = kl.sum(1)
-
-            elbo = -nll - self.beta * kl
-            elbo = elbo.mean()
-
+        #print(prior.variance)
         #print(qz_x.variance)
+
+        # Compute KL divergence between q(z|x) and p(z)
+        
+        kl = torch.abs( torch.norm(qz_x.variance, dim = 2) - prior_loc[:,:,0])
+        kl = kl.sum(1).mean()
+
+        elbo = -nll - self.beta * kl
+        elbo = elbo.mean()
+
         ## add temporal loss
         temporal_loss = (z[:,1:] - z[:,:-1]).abs().mean()
         #elbo = elbo - .01*temporal_loss
 
-        #print(temporal_loss)
-        if elbo > 0:
+        if elbo > 50:
             print((-nll - self.beta * kl).mean().item())
             print(nll.mean().item(),kl.mean().item())
             print(self.temperature, alpha)
@@ -297,100 +295,6 @@ class BackboneGP_VAE(nn.Module):
         if torch.rand(1) < 0.001:
             #print('losses', nll.mean().item(), kl.mean().item(), temporal_loss.item())
             #print(nll_recon.mean().item(), nll_imputation.mean().item())
-            self.plot_latent_series_and_reconstruction(z, px_z, X_ori.detach(), X.detach(), self.latent_dim, time_steps, nll, kl, temporal_loss)
+            self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach(), X.detach(), self.latent_dim, time_steps, nll, kl, temporal_loss)
 
         return -elbo
-
-
-    def forward_old(self, X, missing_mask):
-        batch_size, time_steps, _ = X.size()
-        X_ori = X.repeat(self.K * self.M, 1, 1)
-        missing_mask_ori = missing_mask.repeat(self.K * self.M, 1, 1).type(torch.bool)
-        #missing_mask = missing_mask_ori
-        #X = X_ori
-        X = mcar(X_ori, p = .1)
-        X, missing_mask = fill_and_get_mask_torch(X)
-        missing_mask = (X!=0).type(torch.bool)
-
-        indicating_mask = (missing_mask_ori.float() - missing_mask.float()).to(torch.bool)
-
-        #print(X_ori[indicating_mask][0], X[indicating_mask][0])
-        #print(X_ori[missing_mask_ori][0], X_ori[~missing_mask_ori][0])
-        #print(X[missing_mask][0], X[~missing_mask][0])
-
-        # Encode input to get approximate posterior q(z|x)
-        qz_x = self.encode(X)
-        z = qz_x.rsample()
-
-        # Decode to get likelihood p(x|z)
-        px_z = self.decode(z)
-
-        # Negative log-likelihood (reconstruction loss)
-        nll = -px_z.log_prob(X)
-        nll = torch.where(torch.isfinite(nll), nll, torch.zeros_like(nll))
-        if missing_mask is not None:
-            # Mask out missing data
-            nll = torch.where(missing_mask, nll, torch.zeros_like(nll))
-        nll = nll.sum(dim=(1, 2))
-
-        # Negative log-likelihood (reconstruction loss)
-        nll_imputation = -px_z.log_prob(X_ori)
-        nll_imputation = torch.where(torch.isfinite(nll_imputation), nll_imputation, torch.zeros_like(nll_imputation))
-        if missing_mask is not None:
-            # Mask out missing data
-            nll_imputation = torch.where(indicating_mask, nll_imputation, torch.zeros_like(nll_imputation))
-        nll_imputation = nll_imputation.sum(dim=(1, 2))
-
-        # get final nll
-        nll = (nll + nll_imputation)/2
-
-        ## add temporal loss
-        temporal_loss = (z[:,1:] - z[:,:-1]).pow(2).mean()
-
-        # Compute the number of missing values per sample per time step
-        missing_ratio = missing_mask.float().mean(dim=2)  # Shape: (batch_size * K * M, time_steps)
-
-        # Avoid zero variance by adding a small epsilon
-        epsilon = 1e-6
-        #print('missing_count', missing_ratio.shape, z.shape, missing_ratio.mean())
-        prior_scale = (1 - missing_ratio).pow(.5).unsqueeze(-1) + epsilon  # Shape: (batch_size * K * M, time_steps, 1)
-        prior_scale = prior_scale.expand(-1, -1, self.latent_dim)  # Expand to latent_dim
-        prior_loc = torch.zeros_like(prior_scale)  # Zero mean
-
-        # Create prior distribution with adjusted variance
-        prior = Independent(Normal(prior_loc, prior_scale), 1)  # Independent over latent dimensions
-
-        # Compute KL divergence between q(z|x) and p(z)
-        if self.K > 1:
-            kl = qz_x.log_prob(z) - prior.log_prob(z)
-            kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
-            kl = kl.sum(1)
-
-            weights = -nll - kl
-            weights = torch.reshape(weights, [self.M, self.K, -1])
-
-            elbo = torch.logsumexp(weights, dim=1)
-            elbo = elbo.mean()
-        else:
-            kl = self.kl_divergence(qz_x, prior)
-            kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
-            kl = kl.sum(1)
-
-            #print(qz_x.mean.abs().mean(), qz_x.variance.abs().mean())
-            #print(prior.mean.abs().mean(), prior.variance.abs().mean())
-
-            elbo = -nll - self.beta * kl
-            elbo = elbo.mean()
-
-        # ELBO Loss
-        #elbo = -nll - self.beta * kl
-        #elbo = elbo.mean()
-
-        if torch.rand(1)<.01:
-            print('losses', nll.mean().item(), kl.mean().item())
-
-        elbo += temporal_loss
-
-        return -elbo
-
-
