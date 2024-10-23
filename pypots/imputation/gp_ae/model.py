@@ -36,6 +36,9 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 
 import matplotlib.pyplot as plt
 
+# For kernel parameters estimation
+import gpytorch
+
 class ProbabilisticGP:
     """
     A sub-module of a VAE that corrects the latent time-seties via the Probabilistic GP regression scheme
@@ -114,7 +117,7 @@ class ProbabilisticGP:
             v_adjusted = v * added_variance_bias
             return v_adjusted
 
-    def fit_kernel(self, z_mu_batch, z_sigma_batch, noise_ratio = 100):
+    def fit_kernel(self, training_loader, noise_ratio = 100):
         """
         Fit Gaussian Process kernels for each latent dimension.
 
@@ -122,49 +125,92 @@ class ProbabilisticGP:
             z_mu (Tensor): Mean of the latent variables.
             z_sigma (Tensor): Standard deviation of the latent variables.
         """
-        batch_size, n_samples, n_dims = z_mu_batch.size()
-        self.kernel = []
+        
+        desired_quantile = 0.9
 
-        for i in range(batch_size):
+        likelihood = {}
+        gp_model = {}
+        optimizer = {}
+        mll = {}
 
-            z_mu, z_sigma = z_mu_batch[i], z_sigma_batch[i] #this should be modified to deal with all elements of batch
+        # init Gp models
+        for latent_dim in range(self.latent_size):
 
-            x = np.arange(n_samples).reshape(-1, 1)
+            # Initialize the likelihood and model with empty training data
+            likelihood[latent_dim] = gpytorch.likelihoods.GaussianLikelihood()
+            initial_train_x = torch.empty(0, 1)
+            initial_train_y = torch.empty(0)
+            gp_model[latent_dim] = SequentialGPModel(initial_train_x, initial_train_y, likelihood)
 
-            for dim in range(n_dims):
-                if dim not in self.kernel_params.keys():
-                    self.kernel_params[dim] = {'length_scale': [], 'noise': []}
-                y = z_mu[:, dim].numpy()
-                y_std = z_sigma[:, dim].numpy()
+            # Set the model and likelihood to training mode
+            gp_model[latent_dim].train()
+            likelihood[latent_dim].train()
 
-                # Filter out high uncertainty points
-                quantile = np.quantile(y_std, 0.9)
-                mask = y_std < quantile
-                x_filtered = x[mask]
-                y_filtered = y[mask]
+            # Initialize the optimizer
+            optimizer[latent_dim] = torch.optim.Adam(gp_model[latent_dim].parameters(), lr=0.01)
 
-                # Define kernel
-                kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=1.0, length_scale_bounds=(1e-8, 1e2))
+            # Define the marginal log likelihood
+            mll[latent_dim] = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood[latent_dim], gp_model[latent_dim])
 
-                # Define noise level
-                noise = y_filtered.std() / noise_ratio
+        # start training loop
+        training_step = 0
+        for idx, data in enumerate(training_loader):
+            training_step += 1
+            inputs = self._assemble_input_for_training(data)
+            x = inputs['X']
 
-                # Instantiate GP regressor
-                gp = GaussianProcessRegressor(kernel=kernel, alpha=noise, n_restarts_optimizer=10, normalize_y=True)
+            # encode the data
+            qz_x = self.model.backbone.encode(x)   
+            z_mu, z_var = qz_x.mean, qz_x.variance
 
-                # Fit the GP model to the observed data
-                gp.fit(x_filtered, y_filtered)
-
-                # Set parameters of the ProbabilisticGPRepgressor
-                length_scale = gp.kernel_.get_params()['k2__length_scale']
-                #print(length_scale, self.kernel[dim])
+            for latent_dim in range(self.latent_size):
+                self.fit_kernel_1dim(gp_model[latent_dim], optimizer[latent_dim], z_mu[:,latent_dim], z_var[:,latent_dim])
                 
-                self.kernel_params[dim]['length_scale'] += [length_scale]
-                self.kernel_params[dim]['noise'] += [noise]
+                optimizer[latent_dim].zero_grad()
 
-            #self.kernel.append(ProbabilisticGaussianProcessRegressor(length_scale = length_scale, noise = noise))
+                z_approx, z_true = gp_model[latent_dim]()
 
-            #print('DONE for dim ', dim)
+                loss = -mll[latent_dim](z_approx, z_true)
+
+                loss.backward()
+
+                optimizer[latent_dim].step()
+
+        # Once data is fit, update kernel for every dim
+        for latent_dim in range(self.latent_size):
+            self.kernel_params[latent_dim]['length_scale'] += [length_scale]
+            self.kernel_params[latent_dim]['noise'] += [noise]
+
+            
+        def fit_kernel_1dim(self, gp_model, optimizer, z_mu, z_var):
+            """
+            Fit the kernel for one latent variable
+            """
+
+            # Define time steps
+            T = torch.arange(len(z_mu))
+
+            # filter on points with small variance
+            desired_quantile = .9
+            q = torch.quantile(z_var, desired_quantile)
+            # find a way to update this
+            mask = z_var < q
+            Z_filtered, T_filtered = z_mu[mask], T[mask]
+
+            # Check if there's data after filtering
+            if Z_filtered.shape[0] == 0:
+                continue  # Skip this batch if no data passes the filter
+
+            # Update the GP model's training data
+            gp_model.set_train_data(inputs=T_filtered, targets=Z_filtered, strict=False)
+
+            # Zero gradients from previous iteration
+            optimizer.zero_grad()
+
+            # Forward pass: Compute the GP model output
+            output = gp_model(T_filtered)
+
+            return output, Z_filtered
 
 class ProbabilisticGaussianProcessRegressor: #using torch linalg solve
     def __init__(self, length_scale=1.0, noise=1e-6):
@@ -603,10 +649,6 @@ class GP_VAE(BaseNNImputer):
                 shuffle=False,
                 num_workers=self.num_workers,
             )
-
-        # Step 2bis: learn the kernel
-        #print('fitting kernel')
-        #self._fit_kernel(training_loader)
         
         # Step 2: train the AE model and freeze it
         self._train_model(training_loader, val_loader)
@@ -711,35 +753,31 @@ class GP_VAE(BaseNNImputer):
         self,
         training_loader) -> None:
 
-
-        with torch.no_grad():
-            training_step = 0
-            for idx, data in enumerate(training_loader):
-                training_step += 1
-                inputs = self._assemble_input_for_training(data)
-                x = inputs['X']
-
-                # encode the data
-                qz_x = self.model.backbone.encode(x)   
-                z_mu, z_var = qz_x.mean, qz_x.variance
-
-                self.gp.fit_kernel(z_mu, z_var)
-                print('Done')
-                #if training_step > 10:
-                break
-                #break
-
-            for dim in self.gp.kernel_params.keys():
-                print(self.gp.kernel_params[dim])
-                l, n = self.gp.kernel_params[dim]['length_scale'], self.gp.kernel_params[dim]['noise']
-                plt.subplot(3,1,1)
-                plt.hist(l)
-                plt.subplot(3,1,2)
-                plt.hist(n)
-                plt.subplot(3,1,3)
-                plt.scatter(l,n, alpha = .5)
-                plt.show()
+        self.gp.fit_kernel(training_loader)
 
 
-        
+        for dim in self.gp.kernel_params.keys():
+            print(self.gp.kernel_params[dim])
+            l, n = self.gp.kernel_params[dim]['length_scale'], self.gp.kernel_params[dim]['noise']
+            plt.subplot(3,1,1)
+            plt.hist(l)
+            plt.subplot(3,1,2)
+            plt.hist(n)
+            plt.subplot(3,1,3)
+            plt.scatter(l,n, alpha = .5)
+            plt.show()
+
+    class SequentialGPModel(gpytorch.models.ExactGP):
+        def __init__(self, train_x, train_y, likelihood):
+            super(SequentialGPModel, self).__init__(train_x, train_y, likelihood)
+            self.mean_module = gpytorch.means.ConstantMean()
+            # Use an RBF kernel with ARD to handle multiple dimensions
+            self.covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.RBFKernel(ard_num_dims=latent_dim)
+            )
+
+        def forward(self, x):
+            mean_x = self.mean_module(x)
+            covar_x = self.covar_module(x)
+            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
