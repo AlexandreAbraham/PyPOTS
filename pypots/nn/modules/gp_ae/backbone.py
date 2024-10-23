@@ -18,8 +18,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime
 
-
-
 class BackboneGP_VAE(nn.Module):
     """Modified GPVAE model with prior variance proportional to missing values.
 
@@ -189,23 +187,24 @@ class BackboneGP_VAE(nn.Module):
         nb_missing_vals = (X_np[0] == 0).sum(axis=1)
         missing_ratio = (X_np[0] != 0).mean(axis=1)
         prior_scale = (1 - missing_ratio) ** 0.5
-        plt.plot(prior_scale, label='Prior scale')
-        plt.plot(np.linalg.norm(z_var, axis=1), label='Posterior scale')
+        plt.semilogy(prior_scale, label='Prior scale')
+        plt.semilogy(np.linalg.norm(z_var, axis=1), 'r:', label='Posterior scale')
+        plt.semilogy(z_var, alpha = .5)
         plt.legend()
 
         # Plot original vs reconstructed data for all 10 reconstructions
         plt.subplot(4, 1, 3)
         for i, X_recon_sample in enumerate(reconstructions):
-            plt.plot(range(time_steps), X_recon_sample[0, :, :], label=f'Reconstructed {i+1}', alpha=0.6)
+            plt.plot(range(time_steps), X_recon_sample[0, :, :], alpha=0.6)
         
         plt.gca().set_prop_cycle(None)
-        plt.plot(range(time_steps), X_np[0, :, :], 'o', label='Data with missing Data')
+        plt.plot(range(time_steps), X_np[0, :, :], 'o')
         plt.gca().set_prop_cycle(None)
         plt.plot(range(time_steps), X_ori_np[0, :, :], '+', label='Original Data')
         plt.title('Original vs Reconstructed Data (10 Samples)')
         plt.xlabel('Time Steps')
         plt.ylabel('Feature Values')
-        plt.legend()
+        #plt.legend()
 
         # Save the plot
         plt.tight_layout()
@@ -214,87 +213,83 @@ class BackboneGP_VAE(nn.Module):
 
     # Modified forward function
     def forward(self, X, missing_mask):
+
         batch_size, time_steps, _ = X.size()
-        X_ori = X.repeat(self.K * self.M, 1, 1)
-        missing_mask_ori = missing_mask.repeat(self.K * self.M, 1, 1).type(torch.bool)
-
-        X = mcar(X_ori, p=.3)
-        X, missing_mask = fill_and_get_mask_torch(X)
-        missing_mask = (X != 0).type(torch.bool)
-
+        # Merge prepare_data and simulate_missing_data
+        X_ori, missing_mask_ori, X, missing_mask = self.prepare_and_simulate(X, missing_mask)
+        # get indicating mask of where data has been artificially removed
         indicating_mask = (missing_mask_ori.float() - missing_mask.float()).to(torch.bool)
 
-        # Encode input to get approximate posterior q(z|x)
+        # Encode input to get approximate posterior q(z|x) and sample from it
         qz_x = self.encode(X)
         z = qz_x.rsample()
 
         # Decode to get likelihood p(x|z)
         px_z = self.decode(z)
 
-        # Negative log-likelihood (reconstruction loss)
-        nll_recon = -px_z.log_prob(X)
-        nll_recon = torch.where(torch.isfinite(nll_recon), nll_recon, torch.zeros_like(nll_recon))
-        if missing_mask is not None:
-            nll_recon = torch.where(missing_mask, nll_recon, torch.zeros_like(nll_recon))
-        nll_recon = nll_recon.sum(dim=(1, 2))
-
-        # Negative log-likelihood (reconstruction loss) for imputation
-        nll_imputation = -px_z.log_prob(X_ori)
-        nll_imputation = torch.where(torch.isfinite(nll_imputation), nll_imputation, torch.zeros_like(nll_imputation))
-        if missing_mask is not None:
-            nll_imputation = torch.where(indicating_mask, nll_imputation, torch.zeros_like(nll_imputation))
-        nll_imputation = nll_imputation.sum(dim=(1, 2))
-
-        # get final nll
-        #alpha = self.temperature * .5
-        alpha = .1
+        # Negative log-likelihood
+        nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
+        nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = True) #imputation error
+        alpha = .1 #self.temperature * .5
         nll = nll_recon * (1 - alpha) + nll_imputation * alpha
+
+        ## Compute KL divergence between q(z|x) and p(z) : Here the imposed prior is only on the variance
 
         # Compute the number of missing values per sample per time step
         missing_ratio = missing_mask.float().mean(dim=2)  # Shape: (batch_size * K * M, time_steps)
+        prior_scale = (1 - missing_ratio) # this will be changed to something smarter later on
 
-        # Avoid zero variance by adding a small epsilon
-        epsilon = 1e-3
-        prior_scale = (1 - missing_ratio).pow(0.5).unsqueeze(-1) + epsilon  # Shape: (batch_size * K * M, time_steps, 1)
-        if prior_scale.min() < .4:
-            print(prior_scale.min(), prior_scale.max())
-        prior_scale = prior_scale.expand(-1, -1, self.latent_dim)  # Expand to latent_dim
-        #prior_loc = torch.zeros_like(prior_scale)  # Zero mean
-        prior_loc = qz_x.mean.detach() #no prior on the mean
-
-        # Create prior distribution with adjusted variance
-        prior = Independent(Normal(prior_loc, prior_scale), 1)  # Independent over latent dimensions
-
-        #print(prior.variance)
-        #print(qz_x.variance)
-
-        # Compute KL divergence between q(z|x) and p(z)
-        
-        kl = torch.abs( torch.norm(qz_x.variance, dim = 2) - prior_loc[:,:,0])
+        # The prior on the variance forces the  mean variance to be proportional to the amount of missing
+        # data for the observed point
+        kl = torch.abs( torch.mean(qz_x.variance, dim = 2) - prior_scale)
         kl = kl.sum(1).mean()
 
-        elbo = -nll - self.beta * kl
+        ## Compute a loss based on a Gaussian process prior between 1 point and the next
+        # basically z_{t+1} ~N(z_t, sigma^2)
+        sigma = qz_x.variance.mean().pow(.5) * 5 # this will also be changed to something smarter
+        temporal_loss = (z[:,1:] - z[:,:-1]).pow(2).sum(axis=-1).mean() / sigma**2
+
+        # get final elbo
+        elbo = -nll - self.beta * kl - temporal_loss
         elbo = elbo.mean()
 
-        ## add temporal loss
-        temporal_loss = (z[:,1:] - z[:,:-1]).abs().mean()
-        #elbo = elbo - .01*temporal_loss
-
-        if elbo > 50:
-            print((-nll - self.beta * kl).mean().item())
-            print(nll.mean().item(),kl.mean().item())
-            print(self.temperature, alpha)
-
-
-        assert not (elbo.abs() > 1e6).any(), print( 'elbo too big ', nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item(), temporal_loss.item(), qz_x.variance.mean())
-        assert not (elbo > 50), print( 'elbo negative ', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item(), temporal_loss.item(), qz_x.variance.mean())
-        assert not (torch.isnan(elbo).any()), print( 'elbo is nan ', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item(), temporal_loss.item(), qz_x.variance.mean())
-
-
-        # Occasionally plot the latent series mean and variance and reconstruction
-        if torch.rand(1) < 0.001:
-            #print('losses', nll.mean().item(), kl.mean().item(), temporal_loss.item())
-            #print(nll_recon.mean().item(), nll_imputation.mean().item())
-            self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach(), X.detach(), self.latent_dim, time_steps, nll, kl, temporal_loss)
+        # Validation and optional plotting
+        self.validate_elbo(elbo, nll_recon, nll_imputation, kl, z, qz_x, X_ori, X, time_steps, px_z, temporal_loss)
 
         return -elbo
+
+    def prepare_and_simulate(self, X, missing_mask):
+        """Prepare data by repeating and simulate missing data."""
+        X_ori = X.repeat(self.K * self.M, 1, 1) #augment by K x M if we want to sample multiple times in the latent space (if not K = M = 1)
+        missing_mask_ori = missing_mask.repeat(self.K * self.M, 1, 1).type(torch.bool) 
+        X = mcar(X_ori, p=.3) #missing completely at random, missingness proba = 0.3
+        X, missing_mask = fill_and_get_mask_torch(X) 
+        #missing_mask = (X != 0).type(torch.bool) # just to be sure this is what the missing mask returns
+        return X_ori, missing_mask_ori, X, missing_mask
+
+    def compute_nll(self, px_z, X, mask, keep_best = False):
+        """
+        Compute the negative log-likelihood. If we are dealing with imputation we set keep_best is true, and we only get 
+        the loss on the closest element within each of the K x M samples for each observation 
+        -> I need to explicit the math for this but this helps to keep a diversity within the guesses but still
+        drives the imputation towards the right answer
+        """
+        nll = -px_z.log_prob(X)
+        nll = torch.where(torch.isfinite(nll), nll, torch.zeros_like(nll))
+        if mask is not None:
+            nll = torch.where(mask, nll, torch.zeros_like(nll))
+        if keep_best:
+            a,b,c = nll.shape
+            nll = nll.reshape(self.K * self.M, -1, b, c) #reshape so first axis containts K x M samples for a same observation
+            nll = torch.min(nll, axis = 0)[0]
+            return nll.sum()
+        else:
+            return nll.sum(dim=(1, 2))
+
+    def validate_elbo(self, elbo, nll_recon, nll_imputation, kl, z, qz_x, X_ori, X, time_steps, px_z, tl):
+        """Perform assertions, debugging, and optional plotting."""
+        assert not (elbo.abs() > 1e6).any(), print('elbo too big', nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item())
+        assert not (elbo > 50), print('elbo negative', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item())
+
+        if torch.rand(1) < 0.001: # plot randomly with proba 1/1000 je sais c'est degueu mais j'aime bien
+            self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach(), X.detach(), self.latent_dim, time_steps, -elbo, kl, tl)
