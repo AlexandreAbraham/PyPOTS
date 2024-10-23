@@ -241,7 +241,7 @@ class BackboneGP_VAE(nn.Module):
 
         # The prior on the variance forces the  mean variance to be proportional to the amount of missing
         # data for the observed point
-        kl = torch.abs( torch.mean(qz_x.variance, dim = 2) - prior_scale)
+        kl = ( torch.mean(qz_x.variance, dim = 2) - prior_scale).pow(2)
         kl = kl.sum(1).mean()
 
         ## Compute a loss based on a Gaussian process prior between 1 point and the next
@@ -265,7 +265,7 @@ class BackboneGP_VAE(nn.Module):
         X = mcar(X_ori, p=.3) #missing completely at random, missingness proba = 0.3
         X, missing_mask = fill_and_get_mask_torch(X) 
         #missing_mask = (X != 0).type(torch.bool) # just to be sure this is what the missing mask returns
-        return X_ori, missing_mask_ori, X, missing_mask
+        return X_ori, missing_mask_ori, X, missing_mask.type(torch.bool)
 
     def compute_nll(self, px_z, X, mask, keep_best = False):
         """
