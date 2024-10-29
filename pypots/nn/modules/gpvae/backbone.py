@@ -170,7 +170,7 @@ class BackboneGPVAE(nn.Module):
             kl = torch.where(torch.isfinite(kl), kl, torch.zeros_like(kl))
             kl = kl.sum(1)
 
-            weights = -nll - kl
+            weights = -nll - self.beta * kl
             weights = torch.reshape(weights, [self.M, self.K, -1])
 
             elbo = torch.logsumexp(weights, dim=1)
