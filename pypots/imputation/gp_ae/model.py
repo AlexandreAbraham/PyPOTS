@@ -38,270 +38,139 @@ import matplotlib.pyplot as plt
 
 # For kernel parameters estimation
 import gpytorch
+class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        # Define mean and covariance modules
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel())
+    
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
 
 class ProbabilisticGP:
     """
-    A sub-module of a VAE that corrects the latent time-seties via the Probabilistic GP regression scheme
+    A sub-module of a VAE that corrects the latent time-series via the Probabilistic GP regression scheme
     """
-    def __init__(self):
-        self.encoder = None # this should be a neural network
-        self.kernel = None
+    def __init__(self, AEmodel, assemble_data):
+        self.encoder = AEmodel.encoder
         self.enforce_variance_bias = False
-        self.kernel_params = {}
+        self.latent_size = AEmodel.latent_dim
+        self.gp_models = []
+        self.likelihoods = []
+        self.mll = []
+        self.optimizer = []
+        self.assemble_data = assemble_data
 
-    def correct_embedding_with_gp(self, z_mu, z_sigma):
-        """
-        Correct the latent embeddings using Gaussian Process regression.
+        # Initialize GP models and likelihoods for each latent dimension
+        for _ in range(self.latent_size):
+            likelihood = gpytorch.likelihoods.GaussianLikelihood() #batch_shape = torch.Size([4])
+            x_init, y_init = torch.arange(10), torch.arange(10)
+            gp_model = ExactGPModel(x_init, y_init, likelihood)
+            self.gp_models.append(gp_model)
+            self.likelihoods.append(likelihood)
 
-        Args:
-            z_mu (Tensor): Mean of the latent variables.
-            z_sigma (Tensor): Standard deviation of the latent variables.
+    def fit_kernel(self, training_loader):
 
-        Returns:
-            Tensor: Corrected latent variables.
-        """
-        if self.kernel is None:
-            self.fit_gp_kernels(z_mu.detach(), z_sigma.detach())
+        print('yes')
 
-        n_samples, n_dims = z_mu.shape
-        z_corrected = torch.zeros_like(z_mu)
+        # init models, optimizers and losses for training
+        if False:
+            for model, likelihood in zip(self.gp_models, self.likelihoods):
+                model.train()
+                likelihood.train()
+                optimizer = torch.optim.Adam([
+                    {'params': model.parameters()},
+                    {'params': likelihood.parameters()},
+                ], lr=0.1)
+                mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+                self.optimizer.append(optimizer)
+                self.mll.append(mll)
 
-        x = torch.arange(n_samples).reshape(-1, 1)
-        v = z_sigma.clone()
+        for j in range(len(self.gp_models)):
+            self.gp_models[j].train()
+            self.likelihoods[j].train()
 
-        # Enforce variance bias adjustment
-        if self.enforce_variance_bias:
-            v = self.adjust_variances(v)
+            # Collect parameters from each component
+            gp_model_params = list(self.gp_models[j].parameters())
+            likelihood_params = list(self.likelihoods[j].parameters())
 
-        a,b,temp = self.set_kernel(z_mu)
-
-        for j in range(n_dims):
-            self.kernel[j].fit(x, z_mu[:,j], temp*v[:,j])
-            z_corrected[:,j], var_corrected = self.kernel[j].predict() #predict(x)
-
-        return z_corrected
-
-    def adjust_variances(self, v, window_size=4):
-            """
-            Adjusts variances by enforcing variance bias based on local variance patterns.
-
-            Args:
-                v (torch.Tensor): Variance tensor to adjust.
-                window_size (int): Number of elements to include on each side for local averaging.
-
-            Returns:
-                torch.Tensor: Adjusted variance tensor.
-            """
-            kernel_size = 2 * window_size + 1
-            kernel = torch.ones(kernel_size, device=v.device)
-            kernel[window_size] = 0  # Exclude the current element
-            kernel /= (kernel_size - 1)
-
-            # Pad the variance tensor
-            v_padded = F.pad(v.unsqueeze(0).unsqueeze(0), (window_size, window_size), mode='reflect')
-
-            # Compute local mean variances
-            local_means = F.conv1d(v_padded, kernel.view(1, 1, -1))[0, 0]
-
-            # Calculate variance differences
-            v_diff = (local_means - v).clamp(-1e3, 1e3)
-            v_diff_std = v_diff.std()
-
-            # Avoid division by zero
-            if v_diff_std == 0:
-                added_variance_bias = torch.ones_like(v_diff)
-            else:
-                added_variance_bias = torch.max(torch.tensor(1.0, device=v.device), v_diff / v_diff_std)
-
-            # Apply the adjustment
-            v_adjusted = v * added_variance_bias
-            return v_adjusted
-
-    def fit_kernel(self, training_loader, noise_ratio = 100):
-        """
-        Fit Gaussian Process kernels for each latent dimension.
-
-        Args:
-            z_mu (Tensor): Mean of the latent variables.
-            z_sigma (Tensor): Standard deviation of the latent variables.
-        """
-        
-        desired_quantile = 0.9
-
-        likelihood = {}
-        gp_model = {}
-        optimizer = {}
-        mll = {}
-
-        # init Gp models
-        for latent_dim in range(self.latent_size):
-
-            # Initialize the likelihood and model with empty training data
-            likelihood[latent_dim] = gpytorch.likelihoods.GaussianLikelihood()
-            initial_train_x = torch.empty(0, 1)
-            initial_train_y = torch.empty(0)
-            gp_model[latent_dim] = SequentialGPModel(initial_train_x, initial_train_y, likelihood)
-
-            # Set the model and likelihood to training mode
-            gp_model[latent_dim].train()
-            likelihood[latent_dim].train()
-
-            # Initialize the optimizer
-            optimizer[latent_dim] = torch.optim.Adam(gp_model[latent_dim].parameters(), lr=0.01)
-
-            # Define the marginal log likelihood
-            mll[latent_dim] = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood[latent_dim], gp_model[latent_dim])
-
-        # start training loop
-        training_step = 0
-        for idx, data in enumerate(training_loader):
-            training_step += 1
-            inputs = self._assemble_input_for_training(data)
-            x = inputs['X']
-
-            # encode the data
-            qz_x = self.model.backbone.encode(x)   
-            z_mu, z_var = qz_x.mean, qz_x.variance
-
-            for latent_dim in range(self.latent_size):
-                self.fit_kernel_1dim(gp_model[latent_dim], optimizer[latent_dim], z_mu[:,latent_dim], z_var[:,latent_dim])
-                
-                optimizer[latent_dim].zero_grad()
-
-                z_approx, z_true = gp_model[latent_dim]()
-
-                loss = -mll[latent_dim](z_approx, z_true)
-
-                loss.backward()
-
-                optimizer[latent_dim].step()
-
-        # Once data is fit, update kernel for every dim
-        for latent_dim in range(self.latent_size):
-            self.kernel_params[latent_dim]['length_scale'] += [length_scale]
-            self.kernel_params[latent_dim]['noise'] += [noise]
-
+            # Find shared parameters between gp_model_params and likelihood_params
+            gp_model_params_set = set(gp_model_params)
+            likelihood_params_set = set(likelihood_params)
             
-        def fit_kernel_1dim(self, gp_model, optimizer, z_mu, z_var):
-            """
-            Fit the kernel for one latent variable
-            """
+            unique_gp_model_params = list(gp_model_params_set - likelihood_params_set)
+            unique_likelihood_params = list(likelihood_params_set - gp_model_params_set)
+            shared_params = list(gp_model_params_set & likelihood_params_set)
 
-            # Define time steps
-            T = torch.arange(len(z_mu))
+            # Define optimizer with separate parameter groups for unique and shared parameters
+            optimizer = torch.optim.Adam([
+                {'params': unique_gp_model_params},
+                {'params': unique_likelihood_params},
+                {'params': shared_params}  # only added once
+            ], lr=0.1)
 
-            # filter on points with small variance
-            desired_quantile = .9
-            q = torch.quantile(z_var, desired_quantile)
-            # find a way to update this
-            mask = z_var < q
-            Z_filtered, T_filtered = z_mu[mask], T[mask]
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihoods[j], self.gp_models[j])
 
-            # Check if there's data after filtering
-            if Z_filtered.shape[0] == 0:
-                continue  # Skip this batch if no data passes the filter
-
-            # Update the GP model's training data
-            gp_model.set_train_data(inputs=T_filtered, targets=Z_filtered, strict=False)
-
-            # Zero gradients from previous iteration
-            optimizer.zero_grad()
-
-            # Forward pass: Compute the GP model output
-            output = gp_model(T_filtered)
-
-            return output, Z_filtered
-
-class ProbabilisticGaussianProcessRegressor: #using torch linalg solve
-    def __init__(self, length_scale=1.0, noise=1e-6):
-        self.length_scale = length_scale
-        self.noise = noise
-        #print(noise, 'noise')
-        self.compute_variance = False
-        self.alpha = 1.
-
-    def rbf_kernel(self, X1, X2):
-        """Compute the RBF kernel (Gaussian kernel)."""
-        dists = torch.cdist(X1, X2, p=2)  # Pairwise distances
-        K = torch.exp(-0.5 * (dists / self.length_scale) ** 2)
-        return K
-
-    def fit(self, X_train, y_train, variance):
-        """Fit the Gaussian Process model with training data and probabilities."""
-        # Detach X and y
-        X_train = X_train.detach().reshape(-1,1).float()
-        y_train = y_train.detach().float()
-        
-        self.X_train = X_train
-        self.y_train = y_train
-        #self.probabilities = probabilities
-
-        # Compute the kernel matrix for the training data
-        self.K_star = self.rbf_kernel(X_train, X_train)
-        
-        # Add noise term to the diagonal (regularization)
-        #self.alpha = .5
-
-        # Normalize probas
-        #self.probabilities = self.probabilities / self.probabilities.max()
-        #variance = (1 - self.probabilities)/self.probabilities
-        #variance = -1 * torch.log(self.probabilities)
-        K_regularisation = self.noise * torch.diag(variance).clone()
-        self.K = self.K_star + K_regularisation * self.alpha
-
-        self.bias = torch.sign(y_train) * variance * .05
-
-    def predict(self):
-        """Predict the mean and variance for the training points themselves."""
-        
-        # Mean prediction
-        mu_s = self.K_star @ torch.linalg.solve(self.K, self.y_train + self.bias)
-        #K_star = K_star / K_star.sum(axis=0)[None,:]
-        #mu_s = K_star @ (self.y_train * self.probabilities)
-        
-        if self.compute_variance:
-            # Compute the inverse of the kernel matrix
-            self.K_inv = torch.linalg.solve(self.K, torch.eye(self.K.size(0), device=self.K.device))
-
-            # Variance (which will be 0 for exact points)
-            K_star = self.K_star
-            K_s_s = K_star - K_star @ self.K_inv @ K_star
-            sigma_s = K_s_s.diag()
-
-            M = K_star @ self.K_inv
-            idx = M.shape[0]//2
-            plt.imshow(K_star.detach())
-            plt.title('K_star')
-            plt.show()
-            plt.imshow(M.detach())
-            plt.show()
-            plt.plot(M[idx].detach(), label = 'M')
-            plt.legend()
-            plt.show()
-            plt.plot((M[idx]*self.probabilities).detach())
-            plt.plot((M[idx//2]*self.probabilities).detach())
-            plt.show()
-            plt.legend()
-            plt.show()
-        else:
-            sigma_s = 1
-
-        
-        return mu_s, sigma_s
-
-    def set_kernel(self, z):
+            # Append the optimizer and mll to their respective lists
+            self.optimizer.append(optimizer)
+            self.mll.append(mll)
 
 
-        out = self.encoder.kernel_params(z.mean(axis=0).reshape(1,z.shape[1]))[0]
+        training_iter = 50
+        for i in range(training_iter):
 
-        a = torch.abs(out[0])*10
-        b = torch.abs(out[1])*10
-        temp = torch.exp(out[2])*10
+            # zero grad optimizers
+            for optimizer in zip(self.optimizer):
+                for elt in optimizer:
+                    elt.zero_grad() 
 
-        a, b = torch.tensor(1), torch.tensor(.5)
-        #temp = torch.tensor(10)
+            # start training loop
+            training_step = 0
+            for idx, data in enumerate(training_loader):
+                training_step += 1
+                inputs = self.assemble_data(data)
+                x = inputs['X']
 
-        return a, b, temp
+                # encode the data
+                qz_x = self.encoder(x)   
+                z_mu, z_var = qz_x.mean, qz_x.variance
+
+                for j in range(self.latent_size):
+
+                    loss = 0
+
+                    for batch in range(z_mu.shape[0]):
+
+                        # select values with highest certainty
+                        x, y = self.select_values_for_GP_inference(z_mu[batch,j], z_var[batch,j])
+
+                        # compute loss on those observations only
+                        out = self.gp_models[j](x)
+                        loss = -self.mll[j](out, y)
+
+                    loss.backward()
+
+                    self.optimizer[j].step()
+
+            print('Iter %d/%d - Loss: %.3f   lengthscale: %.3f   noise: %.3f' % (
+                i + 1, training_iter, loss.item(),
+                self.model[0].covar_module.base_kernel.lengthscale.item(),
+                self.model[0].likelihood.noise.item()
+            ))
+
+    def select_values_for_GP_inference(self, z_mu, z_var, q = .9):
+        """
+        Returns a set of values above a certain quantile
+        """
+        x = torch.arange(len(z_mu))
+        quantile = torch.quantile(z_var, q = q)
+        mask = z_var > quantile
+        return x[mask], z_mu[mask]
 
 class GP_VAE(BaseNNImputer):
     """The PyTorch implementation of the GPVAE model :cite:`fortuin2020gpvae`.
@@ -462,7 +331,7 @@ class GP_VAE(BaseNNImputer):
         self.optimizer.init_optimizer(self.model.parameters())
 
         # set gp
-        self.gp = ProbabilisticGP()
+        self.gp = ProbabilisticGP(self.model.backbone, assemble_data = self._assemble_input_for_training)
 
     def _assemble_input_for_training(self, data: list) -> dict:
         # fetch data
@@ -781,3 +650,266 @@ class GP_VAE(BaseNNImputer):
             covar_x = self.covar_module(x)
             return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
+
+class ProbabilisticGP_:
+    """
+    A sub-module of a VAE that corrects the latent time-seties via the Probabilistic GP regression scheme
+    """
+    def __init__(self):
+        self.encoder = None # this should be a neural network
+        self.kernel = None
+        self.enforce_variance_bias = False
+        self.kernel_params = {}
+
+    def correct_embedding_with_gp(self, z_mu, z_sigma):
+        """
+        Correct the latent embeddings using Gaussian Process regression.
+
+        Args:
+            z_mu (Tensor): Mean of the latent variables.
+            z_sigma (Tensor): Standard deviation of the latent variables.
+
+        Returns:
+            Tensor: Corrected latent variables.
+        """
+        if self.kernel is None:
+            self.fit_gp_kernels(z_mu.detach(), z_sigma.detach())
+
+        n_samples, n_dims = z_mu.shape
+        z_corrected = torch.zeros_like(z_mu)
+
+        x = torch.arange(n_samples).reshape(-1, 1)
+        v = z_sigma.clone()
+
+        # Enforce variance bias adjustment
+        if self.enforce_variance_bias:
+            v = self.adjust_variances(v)
+
+        a,b,temp = self.set_kernel(z_mu)
+
+        for j in range(n_dims):
+            self.kernel[j].fit(x, z_mu[:,j], temp*v[:,j])
+            z_corrected[:,j], var_corrected = self.kernel[j].predict() #predict(x)
+
+        return z_corrected
+
+    def adjust_variances(self, v, window_size=4):
+            """
+            Adjusts variances by enforcing variance bias based on local variance patterns.
+
+            Args:
+                v (torch.Tensor): Variance tensor to adjust.
+                window_size (int): Number of elements to include on each side for local averaging.
+
+            Returns:
+                torch.Tensor: Adjusted variance tensor.
+            """
+            kernel_size = 2 * window_size + 1
+            kernel = torch.ones(kernel_size, device=v.device)
+            kernel[window_size] = 0  # Exclude the current element
+            kernel /= (kernel_size - 1)
+
+            # Pad the variance tensor
+            v_padded = F.pad(v.unsqueeze(0).unsqueeze(0), (window_size, window_size), mode='reflect')
+
+            # Compute local mean variances
+            local_means = F.conv1d(v_padded, kernel.view(1, 1, -1))[0, 0]
+
+            # Calculate variance differences
+            v_diff = (local_means - v).clamp(-1e3, 1e3)
+            v_diff_std = v_diff.std()
+
+            # Avoid division by zero
+            if v_diff_std == 0:
+                added_variance_bias = torch.ones_like(v_diff)
+            else:
+                added_variance_bias = torch.max(torch.tensor(1.0, device=v.device), v_diff / v_diff_std)
+
+            # Apply the adjustment
+            v_adjusted = v * added_variance_bias
+            return v_adjusted
+
+    def fit_kernel(self, training_loader, noise_ratio = 100):
+        """
+        Fit Gaussian Process kernels for each latent dimension.
+
+        Args:
+            z_mu (Tensor): Mean of the latent variables.
+            z_sigma (Tensor): Standard deviation of the latent variables.
+        """
+        
+        desired_quantile = 0.9
+
+        likelihood = {}
+        gp_model = {}
+        optimizer = {}
+        mll = {}
+
+        # init Gp models
+        for latent_dim in range(self.latent_size):
+
+            # Initialize the likelihood and model with empty training data
+            likelihood[latent_dim] = gpytorch.likelihoods.GaussianLikelihood()
+            initial_train_x = torch.empty(0, 1)
+            initial_train_y = torch.empty(0)
+            gp_model[latent_dim] = SequentialGPModel(initial_train_x, initial_train_y, likelihood)
+
+            # Set the model and likelihood to training mode
+            gp_model[latent_dim].train()
+            likelihood[latent_dim].train()
+
+            # Initialize the optimizer
+            optimizer[latent_dim] = torch.optim.Adam(gp_model[latent_dim].parameters(), lr=0.01)
+
+            # Define the marginal log likelihood
+            mll[latent_dim] = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood[latent_dim], gp_model[latent_dim])
+
+        # start training loop
+        training_step = 0
+        for idx, data in enumerate(training_loader):
+            training_step += 1
+            inputs = self._assemble_input_for_training(data)
+            x = inputs['X']
+
+            # encode the data
+            qz_x = self.model.backbone.encode(x)   
+            z_mu, z_var = qz_x.mean, qz_x.variance
+
+            for latent_dim in range(self.latent_size):
+                self.fit_kernel_1dim(gp_model[latent_dim], optimizer[latent_dim], z_mu[:,latent_dim], z_var[:,latent_dim])
+                
+                optimizer[latent_dim].zero_grad()
+
+                z_approx, z_true = gp_model[latent_dim]()
+
+                loss = -mll[latent_dim](z_approx, z_true)
+
+                loss.backward()
+
+                optimizer[latent_dim].step()
+
+        # Once data is fit, update kernel for every dim
+        for latent_dim in range(self.latent_size):
+            self.kernel_params[latent_dim]['length_scale'] += [length_scale]
+            self.kernel_params[latent_dim]['noise'] += [noise]
+
+            
+        def fit_kernel_1dim(self, gp_model, optimizer, z_mu, z_var):
+            """
+            Fit the kernel for one latent variable
+            """
+
+            # Define time steps
+            T = torch.arange(len(z_mu))
+
+            # filter on points with small variance
+            desired_quantile = .9
+            q = torch.quantile(z_var, desired_quantile)
+            # find a way to update this
+            mask = z_var < q
+            Z_filtered, T_filtered = z_mu[mask], T[mask]
+
+            # Check if there's data after filtering
+            if Z_filtered.shape[0] > 0:
+
+                # Update the GP model's training data
+                gp_model.set_train_data(inputs=T_filtered, targets=Z_filtered, strict=False)
+
+                # Zero gradients from previous iteration
+                optimizer.zero_grad()
+
+                # Forward pass: Compute the GP model output
+                output = gp_model(T_filtered)
+
+                return output, Z_filtered
+
+class ProbabilisticGaussianProcessRegressor: #using torch linalg solve
+    def __init__(self, length_scale=1.0, noise=1e-6):
+        self.length_scale = length_scale
+        self.noise = noise
+        #print(noise, 'noise')
+        self.compute_variance = False
+        self.alpha = 1.
+
+    def rbf_kernel(self, X1, X2):
+        """Compute the RBF kernel (Gaussian kernel)."""
+        dists = torch.cdist(X1, X2, p=2)  # Pairwise distances
+        K = torch.exp(-0.5 * (dists / self.length_scale) ** 2)
+        return K
+
+    def fit(self, X_train, y_train, variance):
+        """Fit the Gaussian Process model with training data and probabilities."""
+        # Detach X and y
+        X_train = X_train.detach().reshape(-1,1).float()
+        y_train = y_train.detach().float()
+        
+        self.X_train = X_train
+        self.y_train = y_train
+        #self.probabilities = probabilities
+
+        # Compute the kernel matrix for the training data
+        self.K_star = self.rbf_kernel(X_train, X_train)
+        
+        # Add noise term to the diagonal (regularization)
+        #self.alpha = .5
+
+        # Normalize probas
+        #self.probabilities = self.probabilities / self.probabilities.max()
+        #variance = (1 - self.probabilities)/self.probabilities
+        #variance = -1 * torch.log(self.probabilities)
+        K_regularisation = self.noise * torch.diag(variance).clone()
+        self.K = self.K_star + K_regularisation * self.alpha
+
+        self.bias = torch.sign(y_train) * variance * .05
+
+    def predict(self):
+        """Predict the mean and variance for the training points themselves."""
+        
+        # Mean prediction
+        mu_s = self.K_star @ torch.linalg.solve(self.K, self.y_train + self.bias)
+        #K_star = K_star / K_star.sum(axis=0)[None,:]
+        #mu_s = K_star @ (self.y_train * self.probabilities)
+        
+        if self.compute_variance:
+            # Compute the inverse of the kernel matrix
+            self.K_inv = torch.linalg.solve(self.K, torch.eye(self.K.size(0), device=self.K.device))
+
+            # Variance (which will be 0 for exact points)
+            K_star = self.K_star
+            K_s_s = K_star - K_star @ self.K_inv @ K_star
+            sigma_s = K_s_s.diag()
+
+            M = K_star @ self.K_inv
+            idx = M.shape[0]//2
+            plt.imshow(K_star.detach())
+            plt.title('K_star')
+            plt.show()
+            plt.imshow(M.detach())
+            plt.show()
+            plt.plot(M[idx].detach(), label = 'M')
+            plt.legend()
+            plt.show()
+            plt.plot((M[idx]*self.probabilities).detach())
+            plt.plot((M[idx//2]*self.probabilities).detach())
+            plt.show()
+            plt.legend()
+            plt.show()
+        else:
+            sigma_s = 1
+
+        
+        return mu_s, sigma_s
+
+    def set_kernel(self, z):
+
+
+        out = self.encoder.kernel_params(z.mean(axis=0).reshape(1,z.shape[1]))[0]
+
+        a = torch.abs(out[0])*10
+        b = torch.abs(out[1])*10
+        temp = torch.exp(out[2])*10
+
+        a, b = torch.tensor(1), torch.tensor(.5)
+        #temp = torch.tensor(10)
+
+        return a, b, temp
