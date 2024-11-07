@@ -64,7 +64,7 @@ class SparseGPModel(ApproximateGP):
 
         matern_kernel = gpytorch.kernels.MaternKernel(nu=2.5, has_lengthscale = True)  # Default is nu=2.5
         matern_kernel.lengthscale = torch.tensor(1.0)
-        self.covar_module = matern_kernel
+        self.covar_module = matern_kernel + RBFKernel()
         #kernel = gpytorch.kernels.MaternKernel(nu=2.5) + gpytorch.kernels.WhiteNoiseKernel()
 
 
