@@ -51,6 +51,65 @@ class ExactGPModel(gpytorch.models.ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
+from gpytorch.variational import VariationalStrategy, CholeskyVariationalDistribution
+from gpytorch.models import ApproximateGP
+
+class SparseGPModel(ApproximateGP):
+    def __init__(self, inducing_points):
+        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_strategy = VariationalStrategy(self, inducing_points, variational_distribution, learn_inducing_locations=True)
+        super(SparseGPModel, self).__init__(variational_strategy)
+        self.mean_module = gpytorch.means.ConstantMean()
+
+
+        matern_kernel = gpytorch.kernels.MaternKernel(nu=2.5, has_lengthscale = True)  # Default is nu=2.5
+        matern_kernel.lengthscale = torch.tensor(1.0)
+        self.covar_module = matern_kernel
+        #kernel = gpytorch.kernels.MaternKernel(nu=2.5) + gpytorch.kernels.WhiteNoiseKernel()
+
+
+        #self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+
+    
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+import torch
+import gpytorch
+from gpytorch.kernels import RBFKernel, PeriodicKernel, LinearKernel, ScaleKernel
+
+class VariationalComplexGPModel(ApproximateGP):
+    def __init__(self, inducing_points):
+        # Set up variational distribution and strategy with inducing points
+        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_strategy = VariationalStrategy(self, inducing_points, variational_distribution, learn_inducing_locations=True)
+        
+        super(VariationalComplexGPModel, self).__init__(variational_strategy)
+        
+        # Mean module
+        self.mean_module = gpytorch.means.ConstantMean()
+        
+        # Define the composite kernel: (RBF + Periodic) * Linear
+
+        # Initialize the components with specific values
+        rbf_kernel = RBFKernel()
+        rbf_kernel.lengthscale = torch.tensor(1.0)
+
+        periodic_kernel = PeriodicKernel()
+        periodic_kernel.lengthscale = torch.tensor(1.0)
+        periodic_kernel.period_length = torch.tensor(2.0)
+
+        linear_kernel = LinearKernel()
+        linear_kernel.variance = torch.tensor(1.0)
+        self.covar_module = ScaleKernel((rbf_kernel) )
+        
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
 
 class ProbabilisticGP:
     """
@@ -66,17 +125,7 @@ class ProbabilisticGP:
         self.optimizer = []
         self.assemble_data = assemble_data
 
-        # Initialize GP models and likelihoods for each latent dimension
-        for _ in range(self.latent_size):
-            likelihood = gpytorch.likelihoods.GaussianLikelihood() #batch_shape = torch.Size([4])
-            x_init, y_init = torch.arange(10), torch.arange(10)
-            gp_model = ExactGPModel(x_init, y_init, likelihood)
-            self.gp_models.append(gp_model)
-            self.likelihoods.append(likelihood)
-
-    def fit_kernel(self, training_loader):
-
-        print('yes')
+    def instantiate_gp_models(self, training_loader):
 
         # init models, optimizers and losses for training
         if False:
@@ -91,9 +140,30 @@ class ProbabilisticGP:
                 self.optimizer.append(optimizer)
                 self.mll.append(mll)
 
-        for j in range(len(self.gp_models)):
-            self.gp_models[j].train()
-            self.likelihoods[j].train()
+
+        for j in range(self.latent_size):
+
+            # Define inducing points for the sparse GP model
+            n_inducing_pts = 8
+            inducing_points = torch.linspace(0, n_inducing_pts, n_inducing_pts)  # Adjust number of inducing points as needed
+            inducing_points = inducing_points.reshape(1,-1,1).repeat(8, 1, 1)
+            #print(inducing_points.shape)
+
+            # Instantiate model and likelihood
+            gp_model = SparseGPModel(inducing_points=inducing_points)
+            #gp_model = VariationalComplexGPModel(inducing_points = inducing_points)    
+            likelihood = gpytorch.likelihoods.GaussianLikelihood()
+
+            if torch.cuda.is_available():
+                gp_model = gp_model.cuda()
+                likelihood = likelihood.cuda()
+
+            gp_model.train()
+            likelihood.train()
+
+            self.gp_models.append(gp_model)
+            self.likelihoods.append(likelihood)
+
 
             # Collect parameters from each component
             gp_model_params = list(self.gp_models[j].parameters())
@@ -114,56 +184,108 @@ class ProbabilisticGP:
                 {'params': shared_params}  # only added once
             ], lr=0.1)
 
-            mll = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihoods[j], self.gp_models[j])
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihoods[j], self.gp_models[j]) #, num_data = 
+            
 
             # Append the optimizer and mll to their respective lists
             self.optimizer.append(optimizer)
             self.mll.append(mll)
 
+    def fit_kernel(self, training_loader):
+
+        self.instantiate_gp_models(training_loader)
+
+        self.kernel_params = {j:[] for j in range(self.latent_size)}
+
+        dims_to_train = list(np.arange(self.latent_size))
 
         training_iter = 50
         for i in range(training_iter):
+            # Zero grad optimizers
+            for optimizer in self.optimizer:
+                optimizer.zero_grad()
 
-            # zero grad optimizers
-            for optimizer in zip(self.optimizer):
-                for elt in optimizer:
-                    elt.zero_grad() 
-
-            # start training loop
+            # Start training loop
             training_step = 0
             for idx, data in enumerate(training_loader):
                 training_step += 1
                 inputs = self.assemble_data(data)
                 x = inputs['X']
 
-                # encode the data
-                qz_x = self.encoder(x)   
-                z_mu, z_var = qz_x.mean, qz_x.variance
+                # Encode the data
+                qz_x = self.encoder(x)
+                z_mu, z_var = qz_x.mean.detach(), qz_x.variance.detach()   
 
-                for j in range(self.latent_size):
+                #print(dims_to_train)
+                for j in dims_to_train:
 
-                    loss = 0
+                    if len(self.kernel_params[j]) > 30 and np.abs(self.kernel_params[j][-1] - np.array(self.kernel_params[j])[-10:-2].mean()) < 1e-3:
+                        dims_to_train.remove(j)
+                        print(f'No further training for dim {j}')
 
-                    for batch in range(z_mu.shape[0]):
 
-                        # select values with highest certainty
-                        x, y = self.select_values_for_GP_inference(z_mu[batch,j], z_var[batch,j])
+                    #if len(self.kernel_params[j]) > 10 and (self.kernel_params[j][-1] - self.kernel_params[j][-10:-2].mean()).abs() > 1e-3:
+                        # Initialize cumulative loss for dimension `j`
+                    cumulative_loss = 0
 
-                        # compute loss on those observations only
-                        out = self.gp_models[j](x)
-                        loss = -self.mll[j](out, y)
+                    use_batches = True
+                    if not use_batches:
 
-                    loss.backward()
+                        x_selected, y_selected = self.batch_select_values_for_GP_inference(z_mu[:,:,j], z_var[:,:,j])
 
+                        #print(x_selected.shape)
+
+                        out = self.gp_models[j](x_selected).reshape(-1)
+                        loss = -self.mll[j](out, y_selected.reshape(-1))
+
+                        #print(loss.shape)
+
+                        # Accumulate the loss
+                        cumulative_loss += loss.mean()
+
+                    else:
+                    
+                        for batch in range(z_mu.shape[0]):
+
+                            # Select values with highest certainty
+                            x_selected, y_selected = self.select_values_for_GP_inference(z_mu[batch, :, j], z_var[batch, :, j])
+
+                            #plt.plot(x_selected.detach().numpy(), y_selected.detach().numpy(), marker = 'o')
+
+                            # Compute loss on those selected observations only
+                            out = self.gp_models[j](x_selected)
+                            loss = -self.mll[j](out, y_selected)
+
+                            # Accumulate the loss
+                            cumulative_loss += loss
+
+                    length_scale = self.gp_models[j].covar_module.lengthscale.item()
+                    self.kernel_params[j].append(length_scale)
+
+                    # Backward pass for the cumulative loss of dimension `j`
+                    cumulative_loss.backward()
+                    
+                    # Optimizer step for dimension `j`
                     self.optimizer[j].step()
 
-            print('Iter %d/%d - Loss: %.3f   lengthscale: %.3f   noise: %.3f' % (
-                i + 1, training_iter, loss.item(),
-                self.model[0].covar_module.base_kernel.lengthscale.item(),
-                self.model[0].likelihood.noise.item()
-            ))
+                    #print(training_step)
+                    if training_step % 20 == 10:
+                        plt.semilogy(self.kernel_params[j])
+                    
+                if training_step % 20 == 10:
+                    plt.show()
 
-    def select_values_for_GP_inference(self, z_mu, z_var, q = .9):
+            # Optionally print progress after each training iteration
+            #print(f"Iter {i + 1}/{training_iter} - Loss: {cumulative_loss.item():.3f}")
+            try:
+                print(f"RBF Lengthscale: {self.gp_models[0].covar_module.base_kernel.kernels[0].lengthscale.item():.3f}")
+                print(f"Periodic Lengthscale: {self.gp_models[0].covar_module.base_kernel.kernels[1].lengthscale.item():.3f}")
+                print(f"Linear variance: {self.gp_models[0].covar_module.base_kernel.kernels[2].lengthscale.item():.3f}")
+                print(f"Noise: {self.likelihoods[0].noise.item():.3f}")
+            except:
+                continue
+
+    def select_values_for_GP_inference(self, z_mu, z_var, q = .8):
         """
         Returns a set of values above a certain quantile
         """
@@ -171,6 +293,32 @@ class ProbabilisticGP:
         quantile = torch.quantile(z_var, q = q)
         mask = z_var > quantile
         return x[mask], z_mu[mask]
+
+    def batch_select_values_for_GP_inference(self, z_mu, z_var, q = .8):
+        """
+        Returns a set of values above a certain quantile
+        """
+
+        k = 8
+        X, Z = [], []
+        x = torch.arange(z_mu.shape[1])
+
+        for i in range(z_mu.shape[0]):
+            # Sort the indices of z_var[i] in descending order and get top `k` indices
+            top_k_indices = torch.topk(z_var[i], k, largest=True).indices
+
+            # Select values of `x` and `z_mu` corresponding to these indices
+            X.append(x[top_k_indices])
+            Z.append(z_mu[i][top_k_indices])
+
+        # Stack results to ensure same shape
+        X_stacked = torch.stack(X)
+        Z_stacked = torch.stack(Z)
+
+        #print(X_stacked.shape, Z_stacked.shape)
+        
+        return X_stacked, Z_stacked
+
 
 class GP_VAE(BaseNNImputer):
     """The PyTorch implementation of the GPVAE model :cite:`fortuin2020gpvae`.
@@ -624,7 +772,40 @@ class GP_VAE(BaseNNImputer):
 
         self.gp.fit_kernel(training_loader)
 
+    def fit_kernel(
+        self,
+        train_set: Union[dict, str],
+        val_set: Optional[Union[dict, str]] = None,
+        file_type: str = "hdf5",
+    ) -> None:
+        # Step 1: wrap the input data with classes Dataset and DataLoader
+        training_set = DatasetForGPVAE(train_set, return_X_ori=False, return_y=False, file_type=file_type)
+        training_loader = DataLoader(
+            training_set,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+        )
+        val_loader = None
+        if val_set is not None:
+            if not key_in_data_set("X_ori", val_set):
+                raise ValueError("val_set must contain 'X_ori' for model validation.")
+            val_set = DatasetForGPVAE(val_set, return_X_ori=True, return_y=False, file_type=file_type)
+            val_loader = DataLoader(
+                val_set,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+            )
+        
+        # Step 2bis: learn the kernel
+        print('fitting kernel')
+        self._fit_kernel(training_loader)
 
+        # Step 3: save the model if necessary
+        self._auto_save_model_if_necessary(confirm_saving=self.model_saving_strategy == "best")
+
+        # deprecated !!!!
         for dim in self.gp.kernel_params.keys():
             print(self.gp.kernel_params[dim])
             l, n = self.gp.kernel_params[dim]['length_scale'], self.gp.kernel_params[dim]['noise']
@@ -650,6 +831,7 @@ class GP_VAE(BaseNNImputer):
             covar_x = self.covar_module(x)
             return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
+##### OLD ########
 
 class ProbabilisticGP_:
     """

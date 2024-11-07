@@ -103,6 +103,17 @@ class BackboneGP_VAE(nn.Module):
         print(self.encoder)
         print(self.decoder)
 
+    # for tracking
+        self.loss_history = {
+            'elbo': [],
+            'nll_recon': [],
+            'nll_imputation': [],
+            'kl': [],
+            'temporal_loss': [],
+            'dependence_loss': [],
+            'sigma': []
+        }
+
     def encode(self, x):
         return self.encoder(x)
 
@@ -230,8 +241,11 @@ class BackboneGP_VAE(nn.Module):
         # Negative log-likelihood
         nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
         nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = True) #imputation error
+        # sample missing vals of X_ori from p(X^m; X^o)
+        X_sampled = self.sample_missing_vals(X_ori, missing_mask_ori)
+        nll_sampling = self.compute_nll(px_z, X_sampled, ~missing_mask_ori) #? I think the mask is right ?
         alpha = .1 #self.temperature * .5
-        nll = nll_recon * (1 - alpha) + nll_imputation * alpha
+        nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 + nll_sampling * alpha/2
 
         ## Compute KL divergence between q(z|x) and p(z) : Here the imposed prior is only on the variance
 
@@ -241,7 +255,7 @@ class BackboneGP_VAE(nn.Module):
 
         # The prior on the variance forces the  mean variance to be proportional to the amount of missing
         # data for the observed point
-        kl = ( torch.mean(qz_x.variance, dim = 2) - prior_scale).pow(2)
+        kl = ( qz_x.variance - prior_scale.unsqueeze(2)).pow(2)
         kl = kl.sum(1).mean()
 
         ## Compute a loss based on a Gaussian process prior between 1 point and the next
@@ -249,20 +263,160 @@ class BackboneGP_VAE(nn.Module):
         sigma = qz_x.variance.mean().pow(.5) * 5 # this will also be changed to something smarter
         temporal_loss = (z[:,1:] - z[:,:-1]).pow(2).sum(axis=-1).mean() / sigma**2
 
+        # get dependence loss between variance and missingness patterns
+        sigma = np.exp(np.random.uniform(-8,5))
+        dependence_loss, sigma = HSIC_loss(qz_x.variance[::(self.K * self.M)], missing_mask[::(self.K * self.M)])
+
         # get final elbo
-        elbo = -nll - self.beta * kl - temporal_loss
+        elbo = -nll - self.beta * kl - temporal_loss #- dependence_loss * 10000
         elbo = elbo.mean()
+
+        self.loss_history['elbo'].append(elbo.item())
+        self.loss_history['nll_recon'].append(nll_recon.mean().item())
+        self.loss_history['nll_imputation'].append(nll_imputation.mean().item())
+        self.loss_history['kl'].append(kl.mean().item())
+        self.loss_history['temporal_loss'].append(temporal_loss.mean().item())
+        self.loss_history['dependence_loss'].append(dependence_loss.mean().item())
+        self.loss_history['sigma'].append(sigma)
+
+
+        if len(self.loss_history['elbo']) % 100 == 0:
+            self.plot_losses()
 
         # Validation and optional plotting
         self.validate_elbo(elbo, nll_recon, nll_imputation, kl, z, qz_x, X_ori, X, time_steps, px_z, temporal_loss)
 
         return -elbo
 
+    def reconstruction_error(self, px_z, X, X_ori, missing_mask, missing_mask_ori, indicating_mask):
+
+        # Reconstruction error
+        nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
+        nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = True) #imputation error
+        # sample missing vals of X_ori from p(X^m; X^o)
+        X_sampled = self.sample_missing_vals(X_ori, missing_mask_ori)
+        nll_sampling = self.compute_nll(px_z, X_sampled, ~missing_mask_ori) #? I think the mask is right ?
+        alpha = .1 #self.temperature * .5
+        nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 + nll_sampling * alpha/2
+
+        return nll
+
+    def sample_missing_vals(self, X, missing_mask):
+        """
+        Sample along a law that approximates p(x^m|x^o)
+        """
+
+        # Reshape X and missing_mask to 2D tensors
+        batch_size, seq_len, feature_size = X.shape
+        X = X.detach().reshape(-1, feature_size)
+        missing_mask = missing_mask.detach().reshape(-1, feature_size)
+
+        X_recon = X.clone()
+        num_samples = X.shape[0]
+
+        for j in range(feature_size):
+            # Indices of samples where feature j is missing
+            missing_indices = torch.where(missing_mask[:, j])[0]
+            # Indices of samples where feature j is observed
+            observed_indices = torch.where(~missing_mask[:, j])[0]
+
+            if len(observed_indices) > 0:
+
+                # Extract observed values for feature j
+                observed_values = X[observed_indices, j]
+
+                # Compute distances between missing samples and observed samples
+                xi_missing = X[missing_indices]  # Shape: [num_missing, feature_size]
+                xi_observed = X[observed_indices]  # Shape: [num_observed, feature_size]
+
+                # Compute distance matrix using the custom function
+                distances = self.compute_distance_matrix(xi_missing, xi_observed)  # Shape: [num_missing, num_observed]
+
+                # Compute softmax probabilities over negative distances
+                probabilities = torch.softmax(-distances, dim=1)  # Along observed samples
+
+                # Handle infinite distances (no common features)
+                valid_mask = ~torch.isinf(distances)
+                probabilities = probabilities * valid_mask.float()
+                probabilities = probabilities / probabilities.sum(dim=1, keepdim=True)
+
+                # Sample indices for each missing sample
+                sampled_indices = torch.multinomial(probabilities, num_samples=1).squeeze(1)  # Shape: [num_missing]
+
+                # Get the observed values corresponding to the sampled indices
+                sampled_values = observed_values[sampled_indices]  # Shape: [num_missing]
+
+                # Assign the sampled values to the missing positions
+                X_recon[missing_indices, j] = sampled_values
+
+        # Reshape X_recon back to the original shape
+        X_recon = X_recon.reshape(batch_size, seq_len, feature_size)
+        return X_recon
+
+    def compute_distance_matrix(self, xi_missing, xi_observed):
+        """
+        Computes the distance matrix between xi_missing and xi_observed,
+        handling missing values by considering only common observed features
+        and adding expected differences for missing features.
+
+        Args:
+            xi_missing (Tensor): Tensor of shape [num_missing, feature_size].
+            xi_observed (Tensor): Tensor of shape [num_observed, feature_size].
+
+        Returns:
+            distances (Tensor): Tensor of shape [num_missing, num_observed].
+        """
+        num_missing, feature_size = xi_missing.shape
+        num_observed = xi_observed.shape[0]
+
+        # Create masks indicating observed features (non-zero)
+        mask_missing = xi_missing != 0  # Shape: [num_missing, feature_size]
+        mask_observed = xi_observed != 0  # Shape: [num_observed, feature_size]
+
+        # Expand dimensions to align samples for broadcasting
+        xi_missing_exp = xi_missing.unsqueeze(1)  # Shape: [num_missing, 1, feature_size]
+        xi_observed_exp = xi_observed.unsqueeze(0)  # Shape: [1, num_observed, feature_size]
+
+        # Expand masks
+        mask_missing_exp = mask_missing.unsqueeze(1)  # Shape: [num_missing, 1, feature_size]
+        mask_observed_exp = mask_observed.unsqueeze(0)  # Shape: [1, num_observed, feature_size]
+
+        # Compute common observed features mask
+        common_observed_mask = mask_missing_exp & mask_observed_exp  # Shape: [num_missing, num_observed, feature_size]
+
+        # Count number of common observed features for each pair
+        num_common_features = common_observed_mask.sum(dim=2)  # Shape: [num_missing, num_observed]
+
+        # Handle cases with no common features
+        no_common_features = num_common_features == 0
+
+        # Compute squared differences where both features are observed
+        diff = xi_missing_exp - xi_observed_exp  # Shape: [num_missing, num_observed, feature_size]
+        squared_diff = diff ** 2
+
+        # Set squared differences to zero where features are not commonly observed
+        squared_diff = squared_diff * common_observed_mask.float()
+
+        # Sum squared differences over features
+        sum_squared_diff = squared_diff.sum(dim=2)  # Shape: [num_missing, num_observed]
+
+        # Compute expected squared difference for missing features (2.0 per missing feature)
+        num_missing_features = feature_size - num_common_features
+        expected_squared_diff = 2.0 * num_missing_features  # Shape: [num_missing, num_observed]
+
+        # Total squared difference includes observed and expected differences
+        total_squared_diff = sum_squared_diff + expected_squared_diff  # Shape: [num_missing, num_observed]
+
+        # Assign a large distance where there are no common features
+        distances = total_squared_diff.masked_fill(no_common_features, float('inf'))
+
+        return distances
+
     def prepare_and_simulate(self, X, missing_mask):
         """Prepare data by repeating and simulate missing data."""
         X_ori = X.repeat(self.K * self.M, 1, 1) #augment by K x M if we want to sample multiple times in the latent space (if not K = M = 1)
         missing_mask_ori = missing_mask.repeat(self.K * self.M, 1, 1).type(torch.bool) 
-        X = mcar(X_ori, p=.3) #missing completely at random, missingness proba = 0.3
+        X = mcar(X_ori, p=.5) #missing completely at random, missingness proba = 0.3
         X, missing_mask = fill_and_get_mask_torch(X) 
         #missing_mask = (X != 0).type(torch.bool) # just to be sure this is what the missing mask returns
         return X_ori, missing_mask_ori, X, missing_mask.type(torch.bool)
@@ -291,5 +445,70 @@ class BackboneGP_VAE(nn.Module):
         assert not (elbo.abs() > 1e6).any(), print('elbo too big', nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item())
         assert not (elbo > 50), print('elbo negative', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item())
 
-        if torch.rand(1) < 0.001: # plot randomly with proba 1/1000 je sais c'est degueu mais j'aime bien
+        if torch.rand(1) < 0.01: # plot randomly with proba 1/1000 je sais c'est degueu mais j'aime bien
             self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach(), X.detach(), self.latent_dim, time_steps, -elbo, kl, tl)
+
+    def plot_losses(self):
+        iterations = range(1, len(self.loss_history['elbo']) + 1)
+        plt.figure(figsize=(10, 6))
+        plt.semilogy(iterations, self.loss_history['elbo'], label='ELBO')
+        plt.semilogy(iterations, self.loss_history['nll_recon'], label='NLL Recon')
+        plt.semilogy(iterations, self.loss_history['nll_imputation'], label='NLL Imputation')
+        plt.semilogy(iterations, self.loss_history['kl'], label='KL Divergence')
+        plt.semilogy(iterations, self.loss_history['temporal_loss'], label='Temporal Loss')
+        plt.semilogy(iterations, self.loss_history['dependence_loss'], label='Dependence Loss')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss (log scale)')
+        plt.title('Loss Components over Iterations')
+        plt.legend()
+        plt.grid(True)
+
+        plot_path = os.path.join('latent_plots/losses.png')
+
+        # Save the plot
+        plt.tight_layout()
+        plt.savefig(plot_path)
+        plt.close()
+
+def HSIC_loss(A, B, sigma = 1.0):
+    """
+    Loss that computes the covariance between A and B
+    """
+
+    # Flatten the tensors to compute covariance across all elements
+    A = A.reshape(-1, A.shape[-1])
+    B = B.reshape(-1, B.shape[-1]).float()  # Convert to float for computation
+
+    n = A.size(0)  # Number of samples
+    device = A.device
+
+    # Compute Gram matrices
+    K = gaussian_kernel(A, sigma)
+    L = gaussian_kernel(B, sigma)
+
+    # Center the Gram matrices
+    H = centering_matrix(n, device)
+    Kc = H @ K @ H
+    Lc = H @ L @ H
+
+    # Compute HSIC
+    hsic = (1 / (n - 1) ** 2) * torch.trace(Kc @ Lc)
+
+    return hsic, sigma
+
+def gaussian_kernel(X, sigma):
+    """
+    Computes the Gaussian (RBF) kernel matrix for tensor X.
+    """
+    pairwise_distances = torch.cdist(X, X) ** 2  # Shape: [n, n]
+    K = torch.exp(-pairwise_distances / (2 * sigma ** 2))
+    return K
+
+def centering_matrix(n, device):
+    """
+    Creates a centering matrix of size n x n.
+    """
+    I = torch.eye(n).to(device)
+    ones = torch.ones(n, n).to(device) / n
+    H = I - ones
+    return H
