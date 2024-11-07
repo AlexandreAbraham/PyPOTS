@@ -30,66 +30,6 @@ class ProbabilisticGP:
         self.assemble_data = assemble_data
 
     def instantiate_gp_models(self, training_loader):
-
-        # init models, optimizers and losses for training
-        self.gp_models = []
-        self.likelihoods = []
-        self.mll = []
-        self.optimizer = []
-
-        for j in range(self.latent_size):
-
-            # Define inducing points for the sparse GP model
-            n_inducing_pts = 48
-            inducing_points = torch.linspace(0, n_inducing_pts, n_inducing_pts)  # Adjust number of inducing points as needed
-            inducing_points = inducing_points.reshape(1,-1).repeat(8, 1)
-            #print(inducing_points.shape)
-
-            # Instantiate model and likelihood
-            gp_model = SparseGPModel(inducing_points=inducing_points)
-            #gp_model = VariationalComplexGPModel(inducing_points = inducing_points)    
-            likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
-                noise = torch.ones(8,48),
-                noise_constraint = gpytorch.constraints.GreaterThan(1e-9))
-
-            if torch.cuda.is_available():
-                gp_model = gp_model.cuda()
-                likelihood = likelihood.cuda()
-
-            gp_model.train()
-            likelihood.train()
-
-            self.gp_models.append(gp_model)
-            self.likelihoods.append(likelihood)
-
-
-            # Collect parameters from each component
-            gp_model_params = list(self.gp_models[j].parameters())
-            likelihood_params = list(self.likelihoods[j].parameters())
-
-            # Find shared parameters between gp_model_params and likelihood_params
-            gp_model_params_set = set(gp_model_params)
-            likelihood_params_set = set(likelihood_params)
-            
-            unique_gp_model_params = list(gp_model_params_set - likelihood_params_set)
-            unique_likelihood_params = list(likelihood_params_set - gp_model_params_set)
-            shared_params = list(gp_model_params_set & likelihood_params_set)
-
-            # Define optimizer with separate parameter groups for unique and shared parameters
-            optimizer = torch.optim.Adam([
-                {'params': unique_gp_model_params},
-                {'params': unique_likelihood_params},
-                {'params': shared_params}  # only added once
-            ], lr=0.1)
-
-            mll = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihoods[j], self.gp_models[j]) #, num_data = 
-            
-
-            # Append the optimizer and mll to their respective lists
-            self.optimizer.append(optimizer)
-            self.mll.append(mll)
-
-    def instantiate_gp_models(self, training_loader):
         self.gp_models = []
         self.likelihoods = []
         self.mll = []
