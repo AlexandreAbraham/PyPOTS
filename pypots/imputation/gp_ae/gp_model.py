@@ -29,6 +29,8 @@ class ProbabilisticGP:
         self.optimizer = []
         self.assemble_data = assemble_data
 
+
+
     def instantiate_gp_models(self, training_loader):
         self.gp_models = []
         self.likelihoods = []
@@ -95,53 +97,66 @@ class ProbabilisticGP:
             self.mll.append(mll)
 
 # Main function using train_on_batch
-    def fit_kernel(self, training_loader, training_iter=50, batch_iter=100):
+    def fit_kernel(self, training_loader, training_iter=50, batch_iter=1):
         # Instantiate parameters
         self.instantiate_gp_models(training_loader)
         self.kernel_params = {j: [] for j in range(self.latent_size)}
-        dims_to_train = list(np.arange(self.latent_size))
+        self.dims_to_train = list(np.arange(self.latent_size))
 
         for i in range(training_iter):
-            for training_step, data in enumerate(training_loader):
-                inputs = self.assemble_data(data)
-                x_input = inputs['X']
 
-                # Encode the data
-                qz_x = self.encoder(x_input)
-                z_mu, z_var = qz_x.mean.detach(), qz_x.variance.detach()
+            while len(self.dims_to_train) > 0:
 
-                # Train on the batch for batch_iter iterations
-                train_on_batch(
-                    model=self,
-                    gp_models=self.gp_models,
-                    mlls=self.mll,
-                    optimizers=self.optimizer,
-                    batch_x=x_input,
-                    z_mu=z_mu,
-                    z_var=z_var,
-                    dims_to_train=dims_to_train,
-                    n_iter=batch_iter
-                )
+                for training_step, data in enumerate(training_loader):
 
-                # Optional: Plotting kernel parameters
-                if training_step % 20 == 0:
-                    for j in range(self.latent_size):
+
+                    inputs = self.assemble_data(data)
+                    x_input = inputs['X']
+
+                    # Encode the data
+                    qz_x = self.encoder(x_input)
+                    z_mu, z_var = qz_x.mean.detach(), qz_x.variance.detach()
+
+                    # Train on the batch for batch_iter iterations
+                    train_on_batch(
+                        model=self,
+                        gp_models=self.gp_models,
+                        mlls=self.mll,
+                        optimizers=self.optimizer,
+                        batch_x=x_input,
+                        z_mu=z_mu,
+                        z_var=z_var,
+                        n_iter=batch_iter
+                    )
+
+                    # Optional: Plotting kernel parameters
+                    n_plot = 30
+                    if training_step % n_plot == n_plot - 1:
+                        for j in range(self.latent_size):
+
+                            # Plot GP reconstruction for the first sample
+                            plot_gp_reconstruction(
+                                torch.arange(z_mu.size(1)).float(),
+                                z_mu[0, :, j],
+                                self.gp_models[j],
+                                self.likelihoods[j],
+                                j,
+                                training_step
+                            )
+
                         plt.figure()
-                        plt.semilogy(self.kernel_params[j])
+
+                        for j in range(self.latent_size):
+                            plt.semilogy(self.kernel_params[j])
+
                         plt.title(f'Kernel Parameter Progression for Dimension {j}')
                         plt.xlabel('Iteration')
                         plt.ylabel('Lengthscale')
-                        plt.show()
 
-                        # Plot GP reconstruction for the first sample
-                        plot_gp_reconstruction(
-                            torch.arange(z_mu.size(1)).float(),
-                            z_mu[0, :, j],
-                            self.gp_models[j],
-                            self.likelihoods[j],
-                            j,
-                            training_step
-                        )
+                    
+                        plt.savefig('latent_plots/gp_plots/kernels_params.png')
+                        plt.close()
+                        #plt.show()
 
             # Optionally print progress after each training iteration
             try:
@@ -186,7 +201,7 @@ class ProbabilisticGP:
         
         return X_stacked, Z_stacked
 
-def train_on_batch(model, gp_models, mlls, optimizers, batch_x, z_mu, z_var, dims_to_train, n_iter):
+def train_on_batch(model, gp_models, mlls, optimizers, batch_x, z_mu, z_var, n_iter):
     """
     Train the GP models on a single batch for multiple iterations.
     
@@ -205,7 +220,7 @@ def train_on_batch(model, gp_models, mlls, optimizers, batch_x, z_mu, z_var, dim
     
     for _ in range(n_iter):
         # Loop over each dimension to train
-        for j in dims_to_train:
+        for j in model.dims_to_train:
             cumulative_loss = 0.0  # Reset cumulative loss for dimension j
 
             # Loop over each sample in the batch
@@ -216,6 +231,8 @@ def train_on_batch(model, gp_models, mlls, optimizers, batch_x, z_mu, z_var, dim
                 # Extract z_mu and z_var for sample `b` and dimension `j`
                 z_mu_b_j = z_mu[b, :, j].detach()
                 z_var_b_j = z_var[b, :, j].detach()
+
+                model.likelihoods[j].noise = z_var_b_j.detach() / (z_var_b_j.mean().detach() * 100)
                 
                 # Update GP model’s training data for dimension `j`
                 gp_models[j].set_train_data(inputs=x_positions, targets=z_mu_b_j, strict=False)
@@ -236,14 +253,12 @@ def train_on_batch(model, gp_models, mlls, optimizers, batch_x, z_mu, z_var, dim
             )
 
             # Early stopping for dimension `j`
+            criterion = np.std(model.kernel_params[j][-20:]) < 1e-4
             if (
                 len(model.kernel_params[j]) > 30
-                and abs(
-                    model.kernel_params[j][-1]
-                    - np.mean(model.kernel_params[j][-10:-2])
-                ) < 1e-3
+                and criterion
             ):
-                dims_to_train.remove(j)
+                model.dims_to_train.remove(j)
                 print(f'No further training for dim {j}')
 
 def plot_gp_reconstruction(x, z_mu_j, gp_model_j, likelihood_j, j, training_step):
@@ -279,7 +294,10 @@ def plot_gp_reconstruction(x, z_mu_j, gp_model_j, likelihood_j, j, training_step
     plt.title(f'GP Reconstruction for Latent Dimension {j} at Step {training_step}')
     plt.xlabel('Time Steps')
     plt.ylabel('Latent Variable Value')
-    plt.show()
+
+    plt.savefig(f'latent_plots/gp_plots/dim_{j}_iter_{training_step}.png')
+    plt.close()
+    #plt.show()
     
     # Set models back to training mode
     gp_model_j.train()

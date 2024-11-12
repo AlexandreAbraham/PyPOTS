@@ -258,23 +258,30 @@ class BackboneGP_VAE(nn.Module):
 
         # The prior on the variance forces the  mean variance to be proportional to the amount of missing
         # data for the observed point
-        kl = ( qz_x.variance - prior_scale.unsqueeze(2)).pow(2)
-        kl = kl.sum(1).mean()
+        kl = ( qz_x.variance - prior_scale.unsqueeze(2)).pow(2).sum(1).pow(.5)
+        kl = kl.sum()
 
-        kl = torch.tensor(0.)
+        #kl = torch.tensor(0.)
 
         ## Compute a loss based on a Gaussian process prior between 1 point and the next
         # basically z_{t+1} ~N(z_t, sigma^2)
         #sigma = qz_x.variance.mean().pow(.5) * 5 # this will also be changed to something smarter
         sigma = 1
-        temporal_loss = (z[:,1:] - z[:,:-1]).pow(2).sum(axis=-1).mean() / sigma**2
+        mask_diff = (missing_mask[:,1:] * missing_mask[:,:-1])
+        #print(X.shape, z.shape, missing_mask.shape, mask_diff.shape, (X[:,1:] - X[:,-1:]).shape)
+        X_diff = ((X[:,1:] - X[:,-1:])*mask_diff).pow(2).sum(2) / mask_diff.sum(2)
+        #print(X_diff)
+        #print(X_diff.shape)
+        eps = 1e-3
+        temporal_loss = (z[:,1:] - z[:,:-1]).pow(2).sum(2) / (X_diff + eps)
+        temporal_loss = temporal_loss.mean()
 
         # get dependence loss between variance and missingness patterns
         sigma = np.exp(np.random.uniform(-8,5))
         dependence_loss, sigma = HSIC_loss(qz_x.variance[::(self.K * self.M)], missing_mask[::(self.K * self.M)])
 
         # get final elbo
-        elbo = -nll - self.beta * kl - temporal_loss #- dependence_loss * 10000
+        elbo = -nll - self.beta * kl - temporal_loss  #- dependence_loss * 10000
         elbo = elbo.mean()
 
         self.loss_history['elbo'].append(elbo.item())
