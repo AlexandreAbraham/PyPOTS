@@ -103,6 +103,8 @@ class BackboneGP_VAE(nn.Module):
         print(self.encoder)
         print(self.decoder)
 
+        self.p = .5
+
     # for tracking
         self.loss_history = {
             'elbo': [],
@@ -241,11 +243,12 @@ class BackboneGP_VAE(nn.Module):
         # Negative log-likelihood
         nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
         nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = True) #imputation error
+        
         # sample missing vals of X_ori from p(X^m; X^o)
-        X_sampled = self.sample_missing_vals(X_ori, missing_mask_ori)
-        nll_sampling = self.compute_nll(px_z, X_sampled, ~missing_mask_ori) #? I think the mask is right ?
+        #X_sampled = self.sample_missing_vals(X_ori, missing_mask_ori)
+        #nll_sampling = self.compute_nll(px_z, X_sampled, ~missing_mask_ori) #? I think the mask is right ?
         alpha = .1 #self.temperature * .5
-        nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 + nll_sampling * alpha/2
+        nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 #+ nll_sampling * alpha/2
 
         ## Compute KL divergence between q(z|x) and p(z) : Here the imposed prior is only on the variance
 
@@ -258,9 +261,12 @@ class BackboneGP_VAE(nn.Module):
         kl = ( qz_x.variance - prior_scale.unsqueeze(2)).pow(2)
         kl = kl.sum(1).mean()
 
+        kl = torch.tensor(0.)
+
         ## Compute a loss based on a Gaussian process prior between 1 point and the next
         # basically z_{t+1} ~N(z_t, sigma^2)
-        sigma = qz_x.variance.mean().pow(.5) * 5 # this will also be changed to something smarter
+        #sigma = qz_x.variance.mean().pow(.5) * 5 # this will also be changed to something smarter
+        sigma = 1
         temporal_loss = (z[:,1:] - z[:,:-1]).pow(2).sum(axis=-1).mean() / sigma**2
 
         # get dependence loss between variance and missingness patterns
@@ -294,10 +300,10 @@ class BackboneGP_VAE(nn.Module):
         nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
         nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = True) #imputation error
         # sample missing vals of X_ori from p(X^m; X^o)
-        X_sampled = self.sample_missing_vals(X_ori, missing_mask_ori)
-        nll_sampling = self.compute_nll(px_z, X_sampled, ~missing_mask_ori) #? I think the mask is right ?
+        #X_sampled = self.sample_missing_vals(X_ori, missing_mask_ori)
+        #nll_sampling = self.compute_nll(px_z, X_sampled, ~missing_mask_ori) #? I think the mask is right ?
         alpha = .1 #self.temperature * .5
-        nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 + nll_sampling * alpha/2
+        nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 #+ nll_sampling * alpha/2
 
         return nll
 
@@ -416,7 +422,7 @@ class BackboneGP_VAE(nn.Module):
         """Prepare data by repeating and simulate missing data."""
         X_ori = X.repeat(self.K * self.M, 1, 1) #augment by K x M if we want to sample multiple times in the latent space (if not K = M = 1)
         missing_mask_ori = missing_mask.repeat(self.K * self.M, 1, 1).type(torch.bool) 
-        X = mcar(X_ori, p=.5) #missing completely at random, missingness proba = 0.3
+        X = mcar(X_ori, p=self.p) #missing completely at random, missingness proba = 0.3
         X, missing_mask = fill_and_get_mask_torch(X) 
         #missing_mask = (X != 0).type(torch.bool) # just to be sure this is what the missing mask returns
         return X_ori, missing_mask_ori, X, missing_mask.type(torch.bool)
@@ -433,9 +439,13 @@ class BackboneGP_VAE(nn.Module):
         if mask is not None:
             nll = torch.where(mask, nll, torch.zeros_like(nll))
         if keep_best:
+            #print('keep best')
+            #print(torch.where(torch.isfinite(nll), nll, torch.zeros_like(nll)))
             a,b,c = nll.shape
             nll = nll.reshape(self.K * self.M, -1, b, c) #reshape so first axis containts K x M samples for a same observation
-            nll = torch.min(nll, axis = 0)[0]
+            #nll = torch.min(nll, axis = 0)[0]
+            #print('nll')
+            #print(nll)
             return nll.sum()
         else:
             return nll.sum(dim=(1, 2))

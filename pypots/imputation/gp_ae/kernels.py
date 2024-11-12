@@ -20,15 +20,51 @@ class ExactGPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood):
         super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
         # Define mean and covariance modules
-        self.mean_module = gpytorch.means.ConstantMean()
+        batch_shape = torch.Size([8])
+        self.mean_module = gpytorch.means.ConstantMean(batch_shape = batch_shape)
         self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.RBFKernel(batch_shape = torch.tensor([8])))
+            gpytorch.kernels.RBFKernel(batch_shape = batch_shape),
+            batch_shape = batch_shape)
     
     def forward(self, x):
         mean_x = self.mean_module(x)
+        #mean_x = torch.zeros(x.shape)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
+class ExactGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        # Define mean and covariance modules
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel())
+    
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        #mean_x = torch.zeros(x.shape)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+class BatchIndependentMultitaskGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super().__init__(train_x, train_y, likelihood)
+        batch_shape = torch.Size([8])
+        self.mean_module = gpytorch.means.ConstantMean(batch_shape=batch_shape)
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(batch_shape=batch_shape),
+            batch_shape=batch_shape
+        )
+         # Define and combine kernels with consistent batch shape
+        matern_kernel = MaternKernel(nu=2.5, batch_shape=batch_shape)
+        self.covar_module = matern_kernel
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultitaskMultivariateNormal.from_batch_mvn(
+            gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+        )
 
 class SparseGPModel(ApproximateGP):
     def __init__(self, inducing_points):

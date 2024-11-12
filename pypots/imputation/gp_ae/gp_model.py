@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 # For kernel parameters estimation
 import gpytorch
-from .kernels import SparseGPModel
+from .kernels import SparseGPModel, BatchIndependentMultitaskGPModel, ExactGPModel
 
 import numpy as np
 import torch
@@ -37,17 +37,41 @@ class ProbabilisticGP:
 
         for j in range(self.latent_size):
             # Define inducing points for the sparse GP model (batch size 8 assumed here)
-            n_inducing_pts = 48
-            inducing_points = torch.linspace(0, n_inducing_pts - 1, n_inducing_pts).reshape(1, -1).repeat(8, 1)
+            #n_inducing_pts = 48
+            #inducing_points = torch.linspace(0, n_inducing_pts - 1, n_inducing_pts).reshape(1, -1).repeat(8, 1)
             
             # Instantiate model and likelihood
-            gp_model = SparseGPModel(inducing_points=inducing_points)
+            #gp_model = SparseGPModel(inducing_points=inducing_points)
             
             # Ensure noise aligns with the batch and time steps: noise [8, 48] for batched FixedNoiseGaussianLikelihood
-            likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
-                noise=torch.ones(8, 48),  # Adjust to batch_size x num_time_steps
-                noise_constraint=gpytorch.constraints.GreaterThan(1e-9)
-            )
+            #likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
+            #    noise=torch.ones(8, 48),  # Adjust to batch_size x num_time_steps
+            #    noise_constraint=gpytorch.constraints.GreaterThan(1e-9)
+            #)
+
+            batch_training = False
+            if batch_training:
+
+                likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=8)
+
+                n = 48
+                train_x = torch.linspace(0,n-1,n).detach()
+                train_y = train_x.reshape(1,n).repeat(8,1).detach()
+
+                gp_model = BatchIndependentMultitaskGPModel(train_x, train_y, likelihood)
+
+            else:
+                    
+                likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
+                    noise=torch.ones(48)*.1,  # Adjust to batch_size x num_time_steps
+                    noise_constraint=gpytorch.constraints.GreaterThan(1e-9))
+
+                n = 48
+                train_x = torch.linspace(0,n-1,n).detach()
+                train_y = train_x.detach()
+
+                gp_model = ExactGPModel(train_x, train_y, likelihood)
+
 
             if torch.cuda.is_available():
                 gp_model = gp_model.cuda()
@@ -56,84 +80,70 @@ class ProbabilisticGP:
             gp_model.train()
             likelihood.train()
 
-            # Append model and likelihood to lists
-            self.gp_models.append(gp_model)
-            self.likelihoods.append(likelihood)
-
             # Define optimizer and marginal log-likelihood
-            optimizer = torch.optim.Adam([
-                {'params': gp_model.parameters()},
-                {'params': likelihood.parameters()}
-            ], lr=0.1)
+            optimizer = torch.optim.Adam(gp_model.parameters(), lr=0.1)
 
             # Define MLL for the Exact Marginal Log Likelihood
             mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, gp_model)
+
+            # Append model and likelihood to lists
+            self.gp_models.append(gp_model)
+            self.likelihoods.append(likelihood)
             
             # Append optimizer and mll
             self.optimizer.append(optimizer)
             self.mll.append(mll)
 
-
-    def fit_kernel(self, training_loader, training_iter = 50):
-
-        # instantiate parameters
+# Main function using train_on_batch
+    def fit_kernel(self, training_loader, training_iter=50, batch_iter=100):
+        # Instantiate parameters
         self.instantiate_gp_models(training_loader)
-        self.kernel_params = {j:[] for j in range(self.latent_size)}
+        self.kernel_params = {j: [] for j in range(self.latent_size)}
         dims_to_train = list(np.arange(self.latent_size))
 
         for i in range(training_iter):
-            # Zero grad optimizers
-            for optimizer in self.optimizer:
-                optimizer.zero_grad()
-
-            # Start training loop
             for training_step, data in enumerate(training_loader):
                 inputs = self.assemble_data(data)
-                x = inputs['X']
+                x_input = inputs['X']
 
                 # Encode the data
-                qz_x = self.encoder(x)
-                z_mu, z_var = qz_x.mean.detach(), qz_x.variance.detach()   
+                qz_x = self.encoder(x_input)
+                z_mu, z_var = qz_x.mean.detach(), qz_x.variance.detach()
 
-                # create position var
-                x = torch.arange(z_mu.shape[1]).repeat(z_mu.shape[0],1).detach() # time steps
+                # Train on the batch for batch_iter iterations
+                train_on_batch(
+                    model=self,
+                    gp_models=self.gp_models,
+                    mlls=self.mll,
+                    optimizers=self.optimizer,
+                    batch_x=x_input,
+                    z_mu=z_mu,
+                    z_var=z_var,
+                    dims_to_train=dims_to_train,
+                    n_iter=batch_iter
+                )
 
-                #print(dims_to_train)
-                for j in dims_to_train:
-
-                    cumulative_loss = 0
-
-                    print(z_var[:,:,j].shape)
-                    self.likelihoods[j].noise = z_var[:,:,j].clone()
-                    out = self.gp_models[j](x)
-                    #help(out)
-                    print(out.covariance_matrix.shape, z_mu[:,:,j].shape)
-                    loss = -self.mll[j](out, z_mu[:,:,j])
-
-                    # this is just a first test but if the kernel parameters don't change any more we can stop learning them for each latent dim
-                    if len(self.kernel_params[j]) > 30 and np.abs(self.kernel_params[j][-1] - np.array(self.kernel_params[j])[-10:-2].mean()) < 1e-3:
-                        dims_to_train.remove(j)
-                        print(f'No further training for dim {j}')
-
-                    # Backward pass for the cumulative loss of dimension `j`
-                    cumulative_loss.backward()
-                    
-                    # Optimizer step for dimension `j`
-                    self.optimizer[j].step()
-
-                    # update params for plotting
-                    length_scale = self.gp_models[j].covar_module.lengthscale.item()
-                    self.kernel_params[j].append(length_scale)
-
-                    #print(training_step)
-                    if training_step % 20 == 10:
+                # Optional: Plotting kernel parameters
+                if training_step % 20 == 0:
+                    for j in range(self.latent_size):
+                        plt.figure()
                         plt.semilogy(self.kernel_params[j])
-                    
-                if training_step % 20 == 10:
-                    plt.show()
+                        plt.title(f'Kernel Parameter Progression for Dimension {j}')
+                        plt.xlabel('Iteration')
+                        plt.ylabel('Lengthscale')
+                        plt.show()
+
+                        # Plot GP reconstruction for the first sample
+                        plot_gp_reconstruction(
+                            torch.arange(z_mu.size(1)).float(),
+                            z_mu[0, :, j],
+                            self.gp_models[j],
+                            self.likelihoods[j],
+                            j,
+                            training_step
+                        )
 
             # Optionally print progress after each training iteration
-            #print(f"Iter {i + 1}/{training_iter} - Loss: {cumulative_loss.item():.3f}")
             try:
                 print(f"RBF Lengthscale: {self.gp_models[0].covar_module.base_kernel.kernels[0].lengthscale.item():.3f}")
                 print(f"Periodic Lengthscale: {self.gp_models[0].covar_module.base_kernel.kernels[1].lengthscale.item():.3f}")
@@ -176,3 +186,101 @@ class ProbabilisticGP:
         
         return X_stacked, Z_stacked
 
+def train_on_batch(model, gp_models, mlls, optimizers, batch_x, z_mu, z_var, dims_to_train, n_iter):
+    """
+    Train the GP models on a single batch for multiple iterations.
+    
+    Parameters:
+    - model: Main model object (self).
+    - gp_models: List of GP models for each latent dimension.
+    - mlls: List of Marginal Log Likelihood objects for each latent dimension.
+    - optimizers: List of optimizers for each latent dimension.
+    - batch_x: Input data for the batch.
+    - z_mu: Mean of the latent encoding for the batch.
+    - z_var: Variance of the latent encoding for the batch.
+    - dims_to_train: List of dimensions (indices) currently being trained.
+    - n_iter: Number of iterations to run training for each batch.
+    """
+    batch_size, num_points, latent_size = z_mu.size()
+    
+    for _ in range(n_iter):
+        # Loop over each dimension to train
+        for j in dims_to_train:
+            cumulative_loss = 0.0  # Reset cumulative loss for dimension j
+
+            # Loop over each sample in the batch
+            for b in range(batch_size):
+                # Create time step positions for sample `b`
+                x_positions = torch.arange(num_points).float().detach()
+                
+                # Extract z_mu and z_var for sample `b` and dimension `j`
+                z_mu_b_j = z_mu[b, :, j].detach()
+                z_var_b_j = z_var[b, :, j].detach()
+                
+                # Update GP model’s training data for dimension `j`
+                gp_models[j].set_train_data(inputs=x_positions, targets=z_mu_b_j, strict=False)
+                
+                # Compute GP output and loss for dimension `j` and sample `b`
+                output = gp_models[j](x_positions)
+                loss = -mlls[j](output, z_mu_b_j)
+                cumulative_loss += loss
+            
+            # Backward pass and optimizer step for dimension `j`
+            cumulative_loss.backward(retain_graph=True)
+            optimizers[j].step()
+            optimizers[j].zero_grad()
+            
+            # Update kernel parameters
+            model.kernel_params[j].append(
+                gp_models[j].covar_module.base_kernel.lengthscale.item()
+            )
+
+            # Early stopping for dimension `j`
+            if (
+                len(model.kernel_params[j]) > 30
+                and abs(
+                    model.kernel_params[j][-1]
+                    - np.mean(model.kernel_params[j][-10:-2])
+                ) < 1e-3
+            ):
+                dims_to_train.remove(j)
+                print(f'No further training for dim {j}')
+
+def plot_gp_reconstruction(x, z_mu_j, gp_model_j, likelihood_j, j, training_step):
+    # Set models to evaluation mode
+    gp_model_j.eval()
+    likelihood_j.eval()
+    
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        # Ensure x is a tensor of shape [num_points]
+        test_x = x.float()
+        
+        # Make predictions
+        predictions = likelihood_j(gp_model_j(test_x))
+        try:
+            mean = predictions.mean[:,0]
+        except:
+            mean = predictions.mean
+        lower, upper = predictions.confidence_region()
+    
+    # Plotting
+    plt.figure(figsize=(8, 4))
+    # Plot observed data as black stars
+    plt.plot(x.numpy(), z_mu_j.detach().numpy(), 'k*', label='Observed Data')
+    # Plot predictive mean as blue line
+    plt.plot(test_x.numpy(), mean.numpy(), 'b', label='Predictive Mean')
+    # Shade in confidence intervals
+    try:
+        plt.fill_between(test_x.numpy(), lower.numpy()[:,0], upper.numpy()[:,0], alpha=0.5, label='Confidence Interval')
+    except:
+        plt.fill_between(test_x.numpy(), lower.numpy(), upper.numpy(), alpha=0.5, label='Confidence Interval')
+    plt.ylim([z_mu_j.min().item() - 1, z_mu_j.max().item() + 1])
+    plt.legend()
+    plt.title(f'GP Reconstruction for Latent Dimension {j} at Step {training_step}')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Latent Variable Value')
+    plt.show()
+    
+    # Set models back to training mode
+    gp_model_j.train()
+    likelihood_j.train()
