@@ -17,7 +17,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime
-
+import time
 class BackboneGP_VAE(nn.Module):
     """Modified GPVAE model with prior variance proportional to missing values.
 
@@ -65,8 +65,8 @@ class BackboneGP_VAE(nn.Module):
         input_dim,
         time_length,
         latent_dim,
-        encoder_sizes=(64, 64),
-        decoder_sizes=(64, 64),
+        encoder_sizes=(128, 64),
+        decoder_sizes=(64, 128),
         beta=1,
         M=1,
         K=1,
@@ -110,6 +110,7 @@ class BackboneGP_VAE(nn.Module):
             'elbo': [],
             'nll_recon': [],
             'nll_imputation': [],
+            'nll_sampling': [],
             'kl': [],
             'temporal_loss': [],
             'dependence_loss': [],
@@ -227,6 +228,8 @@ class BackboneGP_VAE(nn.Module):
     # Modified forward function
     def forward(self, X, missing_mask):
 
+        #t = time.time()
+
         batch_size, time_steps, _ = X.size()
         # Merge prepare_data and simulate_missing_data
         X_ori, missing_mask_ori, X, missing_mask = self.prepare_and_simulate(X, missing_mask)
@@ -242,13 +245,25 @@ class BackboneGP_VAE(nn.Module):
 
         # Negative log-likelihood
         nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
-        nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = True) #imputation error
+        nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = False) #imputation error
         
+        #print('time beginning', time.time() - t)
+        #t = time.time()
         # sample missing vals of X_ori from p(X^m; X^o)
-        #X_sampled = self.sample_missing_vals(X_ori, missing_mask_ori)
-        #nll_sampling = self.compute_nll(px_z, X_sampled, ~missing_mask_ori) #? I think the mask is right ?
-        alpha = .1 #self.temperature * .5
-        nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 #+ nll_sampling * alpha/2
+        X_sampled, mask_sampled = self.sample_selected_missing_vals(X_ori, missing_mask_ori)
+        nll_sampling = self.compute_nll(px_z, X_sampled, mask_sampled) #? I think the mask is right ?
+
+        #print('time middle', time.time() - t)
+        #t = time.time()
+
+        # renormalize losses
+        #nll_recon, nll_imputation, nll_sampling = nll_recon / 
+
+        #nll_sampling = torch.tensor(0)
+        alpha = .5 #self.temperature * .5
+        nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 + nll_sampling * alpha/2
+
+        #print(nll_recon.mean(), nll_imputation.mean(), nll_sampling.mean())
 
         ## Compute KL divergence between q(z|x) and p(z) : Here the imposed prior is only on the variance
 
@@ -281,17 +296,20 @@ class BackboneGP_VAE(nn.Module):
         dependence_loss, sigma = HSIC_loss(qz_x.variance[::(self.K * self.M)], missing_mask[::(self.K * self.M)])
 
         # get final elbo
-        elbo = -nll - self.beta * kl - temporal_loss  #- dependence_loss * 10000
+        elbo = -nll #- self.beta * kl - temporal_loss  #- dependence_loss * 10000
         elbo = elbo.mean()
+
+        #print('time end', time.time() - t)
+        #t = time.time()
 
         self.loss_history['elbo'].append(elbo.item())
         self.loss_history['nll_recon'].append(nll_recon.mean().item())
         self.loss_history['nll_imputation'].append(nll_imputation.mean().item())
+        self.loss_history['nll_sampling'].append(nll_sampling.mean().item())
         self.loss_history['kl'].append(kl.mean().item())
         self.loss_history['temporal_loss'].append(temporal_loss.mean().item())
         self.loss_history['dependence_loss'].append(dependence_loss.mean().item())
         self.loss_history['sigma'].append(sigma)
-
 
         if len(self.loss_history['elbo']) % 100 == 0:
             self.plot_losses()
@@ -314,114 +332,139 @@ class BackboneGP_VAE(nn.Module):
 
         return nll
 
-    def sample_missing_vals(self, X, missing_mask):
+    def sample_selected_missing_vals(self, X, missing_mask, num_samples=1):
         """
-        Sample along a law that approximates p(x^m|x^o)
-        """
-
-        # Reshape X and missing_mask to 2D tensors
-        batch_size, seq_len, feature_size = X.shape
-        X = X.detach().reshape(-1, feature_size)
-        missing_mask = missing_mask.detach().reshape(-1, feature_size)
-
-        X_recon = X.clone()
-        num_samples = X.shape[0]
-
-        for j in range(feature_size):
-            # Indices of samples where feature j is missing
-            missing_indices = torch.where(missing_mask[:, j])[0]
-            # Indices of samples where feature j is observed
-            observed_indices = torch.where(~missing_mask[:, j])[0]
-
-            if len(observed_indices) > 0:
-
-                # Extract observed values for feature j
-                observed_values = X[observed_indices, j]
-
-                # Compute distances between missing samples and observed samples
-                xi_missing = X[missing_indices]  # Shape: [num_missing, feature_size]
-                xi_observed = X[observed_indices]  # Shape: [num_observed, feature_size]
-
-                # Compute distance matrix using the custom function
-                distances = self.compute_distance_matrix(xi_missing, xi_observed)  # Shape: [num_missing, num_observed]
-
-                # Compute softmax probabilities over negative distances
-                probabilities = torch.softmax(-distances, dim=1)  # Along observed samples
-
-                # Handle infinite distances (no common features)
-                valid_mask = ~torch.isinf(distances)
-                probabilities = probabilities * valid_mask.float()
-                probabilities = probabilities / probabilities.sum(dim=1, keepdim=True)
-
-                # Sample indices for each missing sample
-                sampled_indices = torch.multinomial(probabilities, num_samples=1).squeeze(1)  # Shape: [num_missing]
-
-                # Get the observed values corresponding to the sampled indices
-                sampled_values = observed_values[sampled_indices]  # Shape: [num_missing]
-
-                # Assign the sampled values to the missing positions
-                X_recon[missing_indices, j] = sampled_values
-
-        # Reshape X_recon back to the original shape
-        X_recon = X_recon.reshape(batch_size, seq_len, feature_size)
-        return X_recon
-
-    def compute_distance_matrix(self, xi_missing, xi_observed):
-        """
-        Computes the distance matrix between xi_missing and xi_observed,
-        handling missing values by considering only common observed features
-        and adding expected differences for missing features.
+        Impute missing values by selecting a specific unobserved feature for each point with
+        observed values, and compute distances only with points that have the selected feature
+        observed and share other observed features.
 
         Args:
-            xi_missing (Tensor): Tensor of shape [num_missing, feature_size].
-            xi_observed (Tensor): Tensor of shape [num_observed, feature_size].
-
+            X (Tensor): Input tensor of shape [batch_size, seq_len, feature_size]
+            missing_mask (Tensor): Mask indicating missing values in X
+            num_samples (int): Number of similar observed points to sample from for imputation
+        
         Returns:
-            distances (Tensor): Tensor of shape [num_missing, num_observed].
+            Tensor: Imputed tensor X with selected missing values filled
         """
-        num_missing, feature_size = xi_missing.shape
-        num_observed = xi_observed.shape[0]
 
-        # Create masks indicating observed features (non-zero)
-        mask_missing = xi_missing != 0  # Shape: [num_missing, feature_size]
-        mask_observed = xi_observed != 0  # Shape: [num_observed, feature_size]
+        batch_size, seq_len, feature_size = X.shape
+        X_flat = X.reshape(-1, feature_size)
+        missing_mask_flat = missing_mask.reshape(-1, feature_size)
+        X_recon = X_flat.clone()
+        mask = torch.zeros(X_flat.shape)
 
-        # Expand dimensions to align samples for broadcasting
-        xi_missing_exp = xi_missing.unsqueeze(1)  # Shape: [num_missing, 1, feature_size]
-        xi_observed_exp = xi_observed.unsqueeze(0)  # Shape: [1, num_observed, feature_size]
+        selected_indices = np.random.choice(np.arange(X_flat.shape[0]), size = 100, replace = False)
 
-        # Expand masks
-        mask_missing_exp = mask_missing.unsqueeze(1)  # Shape: [num_missing, 1, feature_size]
-        mask_observed_exp = mask_observed.unsqueeze(0)  # Shape: [1, num_observed, feature_size]
+        #s = time.time()
 
-        # Compute common observed features mask
-        common_observed_mask = mask_missing_exp & mask_observed_exp  # Shape: [num_missing, num_observed, feature_size]
+        for i in selected_indices:
+            #print(time.time() - s)
+            #s = time.time()
+            observed_features = ~missing_mask_flat[i]
+            
+            # Check if there are any unobserved features
+            unobserved_features = torch.where(missing_mask_flat[i])[0]
+            if len(unobserved_features) == 0:
+                continue  # Skip if no unobserved features
 
-        # Count number of common observed features for each pair
-        num_common_features = common_observed_mask.sum(dim=2)  # Shape: [num_missing, num_observed]
+            # Randomly select one unobserved feature j for this point
+            feature_j = unobserved_features[torch.randint(len(unobserved_features), (1,))].item()
 
-        # Handle cases with no common features
-        no_common_features = num_common_features == 0
+            # Find indices of points that have feature j observed and other features in common
+            compatible_indices = torch.where(
+                (~missing_mask_flat[:, feature_j]) & (observed_features & ~missing_mask_flat).any(dim=1)
+            )[0]
 
-        # Compute squared differences where both features are observed
-        diff = xi_missing_exp - xi_observed_exp  # Shape: [num_missing, num_observed, feature_size]
-        squared_diff = diff ** 2
+            if len(compatible_indices) > 0:
+                # Get observed values for feature j from compatible points
+                observed_values_j = X_flat[compatible_indices, feature_j]
 
-        # Set squared differences to zero where features are not commonly observed
-        squared_diff = squared_diff * common_observed_mask.float()
+                # Select features common between xi and compatible points
+                xi = X_flat[i]
+                compatible_points = X_flat[compatible_indices]
+                distances = self.compute_selected_distance(xi, compatible_points, observed_features)
+                
+                # Sample from the closest compatible points based on distances
+                temperature = .01
+                probabilities = torch.softmax(-distances*temperature, dim=0)
+                p = probabilities.detach().numpy().flatten()
 
-        # Sum squared differences over features
-        sum_squared_diff = squared_diff.sum(dim=2)  # Shape: [num_missing, num_observed]
+                if False:
 
-        # Compute expected squared difference for missing features (2.0 per missing feature)
-        num_missing_features = feature_size - num_common_features
-        expected_squared_diff = 2.0 * num_missing_features  # Shape: [num_missing, num_observed]
+                    sorted = np.argsort(probabilities)
+                    samples = np.random.choice(np.arange(len(p))[sorted], size = 100000, p = p)
+                    plt.hist(samples, bins = len(p))
 
-        # Total squared difference includes observed and expected differences
-        total_squared_diff = sum_squared_diff + expected_squared_diff  # Shape: [num_missing, num_observed]
+                    plt.show()
+                    plt.plot(probabilities[sorted])
+                    plt.show()
+                    #sjkomzkz
 
-        # Assign a large distance where there are no common features
-        distances = total_squared_diff.masked_fill(no_common_features, float('inf'))
+                    sampled_idxs = np.random.choice(np.arange(len(p)), size = 100000, p = p)
+                    plt.hist(X_recon[sampled_idxs][:,feature_j].detach())
+                    plt.show()
+
+                    sjkls
+
+
+
+                
+                sampled_idx = torch.multinomial(probabilities, num_samples=num_samples).squeeze()
+                X_recon[i, feature_j] = observed_values_j[sampled_idx]
+                mask[i, feature_j] = 1
+
+
+        return X_recon.reshape(batch_size, seq_len, feature_size), mask.reshape(batch_size, seq_len, feature_size).bool()
+
+    def compute_selected_distance(self, xi, compatible_points, observed_features):
+        """
+        Compute distances only for observed features in xi that are also observed in compatible_points.
+        """
+        common_features_mask = observed_features.unsqueeze(0) & (compatible_points != 0)
+        diff = (xi - compatible_points) ** 2 * common_features_mask.float()
+        distances = diff.sum(dim=1)
+        n_feats = common_features_mask.shape[1]
+
+        # when no common features, replace missing distance by a reasonable quantile of the distance
+        compute_true_quantiles = False
+        if compute_true_quantiles:
+            quantiles = torch.ones(1,n_feats)
+            for j in range(n_feats):
+                vals = diff[:,j][common_features_mask[:,j]]
+                q = torch.quantile(input = vals, q = .6, interpolation = 'higher')
+                #plt.plot(np.sort(vals.detach().numpy()))
+                #plt.axhline(q)
+                #plt.show()
+                quantiles[0,j] = q
+            distances += ((1 - common_features_mask.float()) * quantiles).sum(dim=1)
+        else:
+            #quantiles = torch.ones(1,n_feats) * .5
+            distances += ((1 - common_features_mask.float())).sum(dim=1) * .5
+
+        plot = False
+        if plot:
+
+            plt.imshow(common_features_mask.detach()[:50].T)
+            plt.show()
+            plt.imshow((xi - compatible_points)[:50].detach().T ** 2)
+            plt.show()
+            print(common_features_mask)
+            plt.imshow((common_features_mask.float() + diff).detach()[:50].T)
+            plt.show()
+
+            #fig, ax = plt.subplots(2, sharex = True)
+            plt.imshow((diff + ((1 - common_features_mask.float()) * quantiles)).detach()[:50].T)
+            #distances = distances.masked_fill((distances == 0), 1e8)  # Assign large distances for no common features
+            plt.show()
+            plt.plot(distances.detach()[:50])
+            plt.plot(common_features_mask.float().sum(axis=1).detach()[:50],'o')
+            plt.show()
+
+            sorting = np.argsort(distances.detach().numpy())
+            plt.plot(distances[sorting], label = 'sorted distances')
+            plt.plot(common_features_mask.float().sum(axis=1).detach()[sorting],'o', label = 'number of common labels')
+            plt.legend()
+            plt.show()
 
         return distances
 
@@ -445,17 +488,17 @@ class BackboneGP_VAE(nn.Module):
         nll = torch.where(torch.isfinite(nll), nll, torch.zeros_like(nll))
         if mask is not None:
             nll = torch.where(mask, nll, torch.zeros_like(nll))
-        if keep_best:
+        if keep_best: # only keep ebst approx
             #print('keep best')
             #print(torch.where(torch.isfinite(nll), nll, torch.zeros_like(nll)))
             a,b,c = nll.shape
             nll = nll.reshape(self.K * self.M, -1, b, c) #reshape so first axis containts K x M samples for a same observation
-            #nll = torch.min(nll, axis = 0)[0]
+            nll = torch.min(nll, axis = 0)[0]
             #print('nll')
             #print(nll)
             return nll.sum()
         else:
-            return nll.sum(dim=(1, 2))
+            return torch.tensor(mask.shape).prod() * nll.sum(dim=(1, 2)) / mask.sum()
 
     def validate_elbo(self, elbo, nll_recon, nll_imputation, kl, z, qz_x, X_ori, X, time_steps, px_z, tl):
         """Perform assertions, debugging, and optional plotting."""
@@ -466,14 +509,25 @@ class BackboneGP_VAE(nn.Module):
             self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach(), X.detach(), self.latent_dim, time_steps, -elbo, kl, tl)
 
     def plot_losses(self):
-        iterations = range(1, len(self.loss_history['elbo']) + 1)
+        # Calculate the step size n to ensure we have a maximum of 500 points plotted
+        max_points = 500
+        num_points = len(self.loss_history['elbo'])
+        n = max(1, num_points // max_points)  # Ensure n is at least 1
+
+        # Create the iterations range with step size n
+        iterations = range(1, num_points + 1)[::n]
+        
         plt.figure(figsize=(10, 6))
-        plt.semilogy(iterations, self.loss_history['elbo'], label='ELBO')
-        plt.semilogy(iterations, self.loss_history['nll_recon'], label='NLL Recon')
-        plt.semilogy(iterations, self.loss_history['nll_imputation'], label='NLL Imputation')
-        plt.semilogy(iterations, self.loss_history['kl'], label='KL Divergence')
-        plt.semilogy(iterations, self.loss_history['temporal_loss'], label='Temporal Loss')
-        plt.semilogy(iterations, self.loss_history['dependence_loss'], label='Dependence Loss')
+        
+        # Plot each loss component with downsampling
+        plt.semilogy(iterations, self.loss_history['elbo'][::n], label='ELBO')
+        plt.semilogy(iterations, self.loss_history['nll_recon'][::n], label='NLL Recon')
+        plt.semilogy(iterations, self.loss_history['nll_imputation'][::n], label='NLL Imputation')
+        plt.semilogy(iterations, self.loss_history['nll_sampling'][::n], label='NLL Sampling')
+        plt.semilogy(iterations, self.loss_history['kl'][::n], label='KL Divergence')
+        plt.semilogy(iterations, self.loss_history['temporal_loss'][::n], label='Temporal Loss')
+        #plt.semilogy(iterations, self.loss_history['dependence_loss'][::n], label='Dependence Loss')
+
         plt.xlabel('Iteration')
         plt.ylabel('Loss (log scale)')
         plt.title('Loss Components over Iterations')
