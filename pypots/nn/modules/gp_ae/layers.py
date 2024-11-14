@@ -168,12 +168,12 @@ def make_fc(input_size, output_size, hidden_sizes):
 
     return net
 class GpvaeEncoder(nn.Module):
-    def __init__(self, input_size, z_size, hidden_sizes=(128, 128)):
+    def __init__(self, input_size, z_size, hidden_sizes=(128, 128, 128)):
         super().__init__()
         self.z_size = int(z_size)
         self.input_size = input_size
         self.net, self.mu_layer, self.logvar_layer = make_fc(
-            input_size, (z_size, z_size), hidden_sizes
+            input_size*2, (z_size, z_size), hidden_sizes
         )
 
 
@@ -185,11 +185,12 @@ class GpvaeEncoder(nn.Module):
 
         # Reshape input to [batch_size * time_length, input_size]
         x_reshaped = x.view(batch_size * time_length, input_size)
+        mask = (x_reshaped!=0)
+        x_concat = torch.cat((x_reshaped,mask), dim = 1)
         #print(f"Reshaped input: {x_reshaped.size()}")  # Debug
 
         # Pass through the fully connected network
-        mapped = self.net(x_reshaped)
-        #print(f"Mapped output: {mapped.size()}")  # Debug
+        mapped = self.net(x_concat)
 
         # Compute mean and log variance
         mu = self.mu_layer(mapped)
@@ -293,7 +294,7 @@ class GpvaeDecoder(nn.Module):
 
     def forward(self, x):
         mu = self.net(x) 
-        var = torch.ones_like(mu).type(torch.float)*.5
+        var = torch.ones_like(mu).type(torch.float)*.3
         return torch.distributions.Normal(mu, var)
 
 
@@ -350,6 +351,9 @@ class SimpleVAEEncoder(nn.Module):
 
         # Reshape to process each time step independently
         x = x.view(-1, self.input_size)  # Shape: (batch_size * time_steps, input_size)
+        mask = (x!=0)
+        x = torch.cat((x,mask))
+        print(x.shape)
 
         # Forward pass through the network
         h = self.fc_layers(x)  # Shape: (batch_size * time_steps, last_hidden_size)
