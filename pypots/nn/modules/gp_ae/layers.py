@@ -305,6 +305,102 @@ class GpvaeDecoder(nn.Module):
     ##
 
 
+class GpvaeEncoder_cnn2(nn.Module):
+    def __init__(self, input_size, hidden_sizes, z_size):
+        """This module is an encoder with 1d-convolutional network and multivariate Normal posterior used by GP-VAE with
+        proposed banded covariance matrix
+
+        Parameters
+        ----------
+        input_size : int,
+            the feature dimension of the input
+
+        z_size : int,
+            the feature dimension of the output latent embedding
+
+        hidden_sizes : tuple,
+            the tuple of the hidden layer sizes, and the tuple length sets the number of hidden layers
+
+        window_size : int
+            the kernel size for the Conv1D layer
+        """
+        super().__init__()
+        self.z_size = int(z_size)
+        self.input_size = input_size
+        print('input:', input_size)
+        self.net = nn.Sequential(
+            nn.Conv1d(input_size[1], hidden_sizes[0], kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(hidden_sizes[0], hidden_sizes[1], kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        encoder_dim = hidden_sizes[1]
+        self.mu_layer = nn.Linear(encoder_dim, z_size)
+        self.logvar_layer = nn.Linear(encoder_dim, z_size)
+        
+
+    def forward(self, x, mask=None):
+        batch_size, time_length, input_size = x.size()
+
+        x = x.permute(0, 2, 1)  # Shape: (batch_size, channels, time_points)
+        x = self.net(x)  # Shape: (batch_size, 64, time_points)
+        x = x.permute(0, 2, 1)  # Shape: (batch_size, time_points, 64)
+        mu = self.mu_layer(x)  # Shape: (batch_size, time_points, latent_dim)
+        logvar = self.logvar_layer(x)  # Shape: (batch_size, time_points, latent_dim)
+        
+
+        # Compute standard deviation
+        std = torch.exp(0.5 * logvar)
+    
+        # Reshape tensors back to [batch_size, time_length, z_size]
+        mu = mu.view(batch_size, -1, self.z_size)
+        std = std.view(batch_size, -1, self.z_size)
+        #print(f"Mu shape after reshape: {mu.size()}")     # [batch_size, time_length, z_size]
+        #print(f"Std shape after reshape: {std.size()}")   # [batch_size, time_length, z_size]
+
+        # Create Normal distribution
+        z_dist = torch.distributions.Normal(loc=mu, scale=std)
+        # Make it an Independent distribution over the last dimension (latent dimension)
+        z_dist = torch.distributions.Independent(z_dist, 1)
+
+        assert not torch.isnan(mu).any(), print(mu)
+        assert not torch.isnan(std).any(), print(std)
+
+        return z_dist
+
+
+class GpvaeDecoder_cnn2(nn.Module):
+    def __init__(self, input_size, hidden_sizes, latent_dim):
+        """This module is a decoder with Gaussian output distribution.
+
+        Parameters
+        ----------
+        output_size : int,
+            the feature dimension of the output
+
+        hidden_sizes: tuple
+            the tuple of hidden layer sizes, and the tuple length sets the number of hidden layers.
+        """
+        super().__init__()
+
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(latent_dim, hidden_sizes[0]),
+            nn.ReLU(),
+        )
+        self.decoder_cnn = nn.Sequential(
+            nn.ConvTranspose1d(hidden_sizes[0], hidden_sizes[1], kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(hidden_sizes[1], input_size[1], kernel_size=3, padding=1),
+        )
+
+    def forward(self, z, mask=None):
+        x = self.decoder_fc(z)  # Shape: (batch_size, time_points, 64)
+        x = x.permute(0, 2, 1)  # Shape: (batch_size, 64, time_points)
+        x = self.decoder_cnn(x)  # Shape: (batch_size, input_channels, time_points)
+        x = x.permute(0, 2, 1)  # Shape: (batch_size, time_points, input_channels)
+        var = torch.ones_like(x).type(torch.float)*.5
+        return torch.distributions.Normal(x, var)
+
 
 
 
