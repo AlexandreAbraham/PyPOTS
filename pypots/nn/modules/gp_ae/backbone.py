@@ -167,6 +167,7 @@ class BackboneGP_VAE(nn.Module):
         #kl = ( qz_x.variance.mean(2) - prior_scale).pow(2).sum(1).pow(.5)
         kl = qz_x.mean.pow(2).sum(2).pow(.5).mean()
         kl = kl.sum()
+        #kl += -torch.log(qz_x.variance.abs().mean())/50
 
         ## Compute a loss based on a Gaussian process prior between 1 point and the next
         # basically z_{t+1} ~N(z_t, sigma^2)
@@ -190,7 +191,7 @@ class BackboneGP_VAE(nn.Module):
         #print('time end', time.time() - t)
         #t = time.time()
 
-        self.loss_history['elbo'].append(elbo.item())
+        self.loss_history['elbo'].append(-1*elbo.item())
         self.loss_history['nll_recon'].append(nll_recon.mean().item())
         self.loss_history['nll_imputation'].append(nll_imputation.mean().item())
         self.loss_history['nll_sampling'].append(nll_sampling.mean().item())
@@ -263,6 +264,7 @@ class BackboneGP_VAE(nn.Module):
 
         # Negative log-likelihood
         nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
+        nll_recon += self.compute_nll(px_z, X_ori, indicating_mask, keep_best = False) #imputation error
         #nll_recon = torch.tensor(0.01)
         #nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = False) #imputation error
         nll_imputation = self.latent_imputation_error(qz_x, X_ori)
@@ -280,9 +282,10 @@ class BackboneGP_VAE(nn.Module):
 
         #print(nll_sampling)
 
-        alpha = .5 #self.temperature * .5
-        if self.p <= .01:
-            alpha = 0
+        #alpha = .01 #self.temperature * .5
+        #if self.p <= .01:
+            #alpha = 0.001
+        alpha = self.p
         nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 + nll_sampling * alpha/2
 
 
