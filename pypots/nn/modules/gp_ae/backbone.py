@@ -6,7 +6,8 @@ from .layers import (
     SimpleVAEDecoder,
     GpvaeEncoder, #modified versinos
     GpvaeDecoder, #modified versions
-    GaussianProcess
+    GaussianProcess,
+    FactorNet
 )
 
 # for mcar imputation
@@ -88,7 +89,8 @@ class BackboneGP_VAE(nn.Module):
         self.latent_dim = latent_dim
         self.beta = beta
         self.encoder = GpvaeEncoder(input_dim, latent_dim, encoder_sizes)
-        self.decoder = GpvaeDecoder(latent_dim, input_dim, encoder_sizes)
+        #self.encoder = FactorNet(input_dim, latent_dim, encoder_sizes)
+        self.decoder = GpvaeDecoder(latent_dim, input_dim, decoder_sizes)
         self.M = M
         self.K = K
 
@@ -119,8 +121,8 @@ class BackboneGP_VAE(nn.Module):
             'sigma': []
         }
 
-    def encode(self, x):
-        return self.encoder(x)
+    def encode(self, x, missing_mask = None):
+        return self.encoder(x, missing_mask)
 
     def decode(self, z):
         return self.decoder(z)
@@ -137,29 +139,33 @@ class BackboneGP_VAE(nn.Module):
         batch_size, time_steps, _ = X.size()
         # Merge prepare_data and simulate_missing_data
         X_ori, missing_mask_ori, X, missing_mask = self.prepare_and_simulate(X, missing_mask)
+        missing_mask = (X!=0)
+        missing_mask_ori = (X_ori!=0)
         # get indicating mask of where data has been artificially removed
         indicating_mask = (missing_mask_ori.float() - missing_mask.float()).to(torch.bool)
 
         # Encode input to get approximate posterior q(z|x) and sample from it
-        qz_x = self.encode(X)
+        qz_x = self.encode(X, missing_mask)
         z = qz_x.rsample()
+
+        #missing_mask[:,::2,1::2] = 1
+        #z = qz_x.mean
 
         # Decode to get likelihood p(x|z)
         px_z = self.decode(z)
 
-        nll, nll_recon, nll_imputation, nll_sampling = self.reconstruction_error(px_z, X, X_ori, missing_mask, missing_mask_ori, indicating_mask)
-
+        nll, nll_recon, nll_imputation, nll_sampling = self.reconstruction_error(qz_x, px_z, X, X_ori, missing_mask, missing_mask_ori, indicating_mask)
 
         ## Compute KL divergence between q(z|x) and p(z) : Here the imposed prior is only on the variance
 
-        # Compute the number of missing values per sample per time step
+        # Compute the number" of missing values per sample per time step
         missing_ratio = missing_mask.float().mean(dim=2)  # Shape: (batch_size * K * M, time_steps)
         prior_scale = 1./(1 + (1 - missing_ratio)) # this will be changed to something smarter later on
 
         # The prior on the variance forces the  mean variance to be proportional to the amount of missing
         # data for the observed point
-        kl = ( qz_x.variance.mean(2) - prior_scale).pow(2).sum(1).pow(.5)
-        #kl += qz_x.mean.pow(2).sum(2).pow(.5).mean()
+        #kl = ( qz_x.variance.mean(2) - prior_scale).pow(2).sum(1).pow(.5)
+        kl = qz_x.mean.pow(2).sum(2).pow(.5).mean()
         kl = kl.sum()
 
         ## Compute a loss based on a Gaussian process prior between 1 point and the next
@@ -201,22 +207,82 @@ class BackboneGP_VAE(nn.Module):
 
         return -elbo
 
-    def reconstruction_error(self, px_z, X, X_ori, missing_mask, missing_mask_ori, indicating_mask):
+    def latent_imputation_error(self, qz_x, X_ori):
+        """
+        Loss that forces qz_x to contain X_ori
+        """
+
+        qz_x_ori = self.encode(X_ori)
+
+        loss = -qz_x.log_prob(qz_x_ori.mean.detach())
+
+        #print(loss.mean(), qz_x.variance.mean())
+
+        return loss/100
+
+    def latent_sampling_error(self, qz_x, X_sampled):
+        """
+        This error forces the AE to learn representation of missing values
+        X_sampled (num_samples, batch_size, n_observations, n_dimensions)
+        """
+
+        Z_sampled = []
+        loss = 0
+        # For each sample, compute the log prob of its embedding mean belonging to qz_x
+        for x_sampled in X_sampled:
+            qz_x_sampled = self.encode(x_sampled)
+            #z_sampled = qz_x_sampled.rsample().detach()
+            #print(z_sampled, qz_x.mean)
+            #loss -= qz_x.log_prob(z_sampled) 
+
+            loss -= qz_x_sampled.log_prob(qz_x.rsample().detach()) #.mean.detach()
+
+            #print(loss, qz_x.mean.flatten().shape)
+
+            #print(loss.mean())
+
+        return 100 * loss/len(qz_x.mean.flatten())
+
+
+    def sampling_error(self, qz_x, X_ori, missing_mask_ori):
+        """
+        Forces the 
+        """
+
+        # Reconstruct 
+        num_samples = 10
+        X_sampled, mask_sampled = self.sample_selected_missing_vals(X_ori, missing_mask_ori, num_samples = num_samples)
+        # permute dimensions to have the first dimension being the number of samples
+        X_sampled = torch.permute(X_sampled, (3, 0, 1, 2)) 
+        loss = self.latent_sampling_error(qz_x, X_sampled)
+
+        return loss.mean() #sum(axis = 1)
+
+
+    def reconstruction_error(self, qz_x, px_z, X, X_ori, missing_mask, missing_mask_ori, indicating_mask):
 
         # Negative log-likelihood
         nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
-        nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = False) #imputation error
-        
-        if self.sampling:
+        #nll_recon = torch.tensor(0.01)
+        #nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = False) #imputation error
+        nll_imputation = self.latent_imputation_error(qz_x, X_ori)
+
+        if self.sampling and False:
             num_samples = 1
             X_sampled, mask_sampled = self.sample_selected_missing_vals(X_ori, missing_mask_ori, num_samples = num_samples)
             nll_sampling = 0
             for i in range(num_samples):
                 nll_sampling += self.compute_nll(px_z, X_sampled[:,:,:,i], mask_sampled) 
+        if self.sampling:
+            nll_sampling = self.sampling_error(qz_x, X_ori, missing_mask_ori)
         else:
             nll_sampling = torch.tensor(1).float()
 
+        #print(nll_sampling)
+
         alpha = .5 #self.temperature * .5
+        if self.p <= .01:
+            alpha = 0
         nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 + nll_sampling * alpha/2
 
 
@@ -363,14 +429,15 @@ class BackboneGP_VAE(nn.Module):
 
         return distances
 
-    def compute_nll(self, px_z, X, mask, keep_best = False):
+    def compute_nll_(self, px_z, X, mask, keep_best = False):
         """
         Compute the negative log-likelihood. If we are dealing with imputation we set keep_best is true, and we only get 
         the loss on the closest element within each of the K x M samples for each observation 
         -> I need to explicit the math for this but this helps to keep a diversity within the guesses but still
         drives the imputation towards the right answer
         """
-        nll = -px_z.log_prob(X)
+        #nll = -px_z.log_prob(X)
+        nll = (X - px_z.mean).pow(2)
         nll = torch.where(torch.isfinite(nll), nll, torch.zeros_like(nll))
         nll = torch.where(nll >= 0, nll, torch.zeros_like(nll))
         if mask is not None:
@@ -387,11 +454,16 @@ class BackboneGP_VAE(nn.Module):
         else:
             return torch.tensor(mask.shape).prod() * nll.sum(dim=(1, 2)) / mask.sum()
 
+    def compute_nll(self, px_z, X, mask, keep_best = False):
+
+        mse = (X - px_z.mean).pow(2)
+        return mse[mask].float().mean()
+
 # helpers and plotters
 
     def prepare_and_simulate(self, X, missing_mask):
         """Prepare data by repeating and simulate missing data."""
-        X_ori = X.repeat(self.K * self.M, 1, 1) #augment by K x M if we want to sample multiple times in the latent space (if not K = M = 1)
+        X_ori = torch.clone(X.repeat(self.K * self.M, 1, 1)) #augment by K x M if we want to sample multiple times in the latent space (if not K = M = 1)
         missing_mask_ori = missing_mask.repeat(self.K * self.M, 1, 1).type(torch.bool) 
         X = mcar(X_ori, p=self.p) #missing completely at random, missingness proba = 0.3
         X, missing_mask = fill_and_get_mask_torch(X) 
@@ -405,7 +477,7 @@ class BackboneGP_VAE(nn.Module):
         assert not (elbo > 50), print('elbo negative', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item())
 
         
-        if len(self.loss_history['elbo']) % 10 == 0: # plot randomly with proba 1/1000 je sais c'est degueu mais j'aime bien
+        if len(self.loss_history['elbo']) % 100 == 0: # plot randomly with proba 1/1000 je sais c'est degueu mais j'aime bien
             self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach(), X.detach(), self.latent_dim, time_steps, -elbo, kl, tl)
 
     def plot_losses(self):
@@ -485,6 +557,9 @@ class BackboneGP_VAE(nn.Module):
             z_sample = qz_x.rsample()  # Sample from the posterior
             px_z_sample = self.decode(z_sample)  # Reconstruct the data
             X_recon_sample = px_z_sample.mean.detach().cpu().numpy()  # Get the mean of the reconstruction
+            # set first half of non reconstructed values to nan
+            num_missing_vals = np.sum(X_ori_np == 0)
+            X_recon_sample[X_ori_np == 0][:num_missing_vals//2] == np.nan
             reconstructions.append(X_recon_sample)
 
         X_ori_np[X_ori_np == 0] = np.nan
@@ -504,7 +579,7 @@ class BackboneGP_VAE(nn.Module):
         plt.subplot(4, 1, 1)
         for dim in range(latent_dim):
             plt.plot(range(time_steps), z_mean[:, dim], label=f'Latent dim {dim} Mean')
-            plt.fill_between(range(time_steps), z_mean[:, dim] - z_var[:, dim], z_mean[:, dim] + z_var[:, dim], alpha=0.2)
+            plt.fill_between(range(time_steps), z_mean[:, dim] - z_var[:, dim]**.5, z_mean[:, dim] + z_var[:, dim]**.5, alpha=0.2)
 
         plt.title('Latent Time Series (Mean and Variance) ' + losses)
         plt.xlabel('Time Steps')

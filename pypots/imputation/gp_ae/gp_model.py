@@ -29,8 +29,6 @@ class ProbabilisticGP:
         self.optimizer = []
         self.assemble_data = assemble_data
 
-
-
     def instantiate_gp_models(self, training_loader):
         self.gp_models = []
         self.likelihoods = []

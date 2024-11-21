@@ -151,7 +151,9 @@ def make_fc(input_size, output_size, hidden_sizes):
 
     # Add additional hidden layers
     for i, h in zip(hidden_sizes[:-1], hidden_sizes[1:]):
-        layers.extend([nn.Linear(i, h), nn.BatchNorm1d(h), nn.ReLU()]) # add batchnorm
+        #layers.extend([nn.Linear(i, h), nn.BatchNorm1d(h), nn.ReLU()]) # add batchnorm
+        layers.extend([nn.Linear(i, h), nn.LeakyReLU()]) # add batchnorm
+
 
     # Handle output layers
     if isinstance(output_size, tuple):
@@ -179,13 +181,14 @@ class GpvaeEncoder(nn.Module):
 
 
 
-    def forward(self, x):
+    def forward(self, x, mask = None):
         batch_size, time_length, input_size = x.size()
         #print(f"Input shape: {x.size()}")  # Debug
 
         # Reshape input to [batch_size * time_length, input_size]
-        x_reshaped = x.view(batch_size * time_length, input_size)
+        x_reshaped = torch.clone(x.view(batch_size * time_length, input_size))
         mask = (x_reshaped!=0)
+        x_reshaped[~mask] = torch.rand(size = x_reshaped[~mask].shape)
         x_concat = torch.cat((x_reshaped,mask), dim = 1)
         #print(f"Reshaped input: {x_reshaped.size()}")  # Debug
 
@@ -296,6 +299,8 @@ class GpvaeDecoder(nn.Module):
         mu = self.net(x) 
         var = torch.ones_like(mu).type(torch.float)*.3
         return torch.distributions.Normal(mu, var)
+
+    ##
 
 
 
@@ -558,3 +563,199 @@ class GaussianProcess(nn.Module):
         prior = MultivariateNormal(prior_loc, covariance_matrix=kernel_matrices)
 
         return prior
+
+
+##### FROM ASHMAN
+
+from .layers_ashman import LinearNN, NNHeteroGaussian
+from torch.nn import functional as F
+from torch.distributions import Normal
+
+class FactorNet(nn.Module):
+    """FactorNet from Sparse Gaussian Process Variational Autoencoders.
+
+    :param in_dim (int): dimension of the input variable.
+    :param out_dim (int): dimension of the output variable.
+    :param h_dims (list, optional): dimensions of hidden layers.
+    :param min_sigma (float, optional): sets the minimum output sigma.
+    :param initi_sigma (float, optional): sets the initial output sigma.
+    :param nonlinearity (function, optional): non-linearity to apply in
+    between layers.
+    """
+    def __init__(self, input_size, z_size, hidden_sizes=(128, 128, 128), min_sigma=1e-3,
+                 init_sigma=None, nonlinearity=F.relu):
+        super().__init__()
+
+        in_dim = input_size
+        out_dim = z_size
+        h_dims = hidden_sizes
+
+        self.out_dim = out_dim
+
+        # Rescale sigmas for multiple outputs.
+        if init_sigma is not None:
+            init_sigma = init_sigma * in_dim ** 0.5
+
+        min_sigma = min_sigma * in_dim ** 0.5
+
+        # A network for each dimension.
+        self.networks = nn.ModuleList()
+        for _ in range(in_dim):
+            self.networks.append(NNHeteroGaussian(
+                1, out_dim, h_dims, min_sigma, init_sigma,
+                nonlinearity=nonlinearity))
+
+    def forward(self, z, mask=None):
+        """Returns parameters of a diagonal Gaussian distribution."""
+        np_1 = torch.zeros(z.shape[0], z.shape[1], self.out_dim)
+        np_2 = torch.zeros_like(np_1)
+
+        # Pass through individual networks.
+        #print(z.transpose(0, 2).shape)
+        for dim, z_dim in enumerate(z.permute(2, 0, 1)):
+            print(z_dim.shape)
+            if mask is not None:
+                batch_idx, time_idx = torch.where(mask[:, :, dim])[0]
+                z_in = z_dim[batch_idx, time_idx]
+                z_in_shape = z_in.shape
+                z_in = z_in.flatten().unsqueeze(1)
+
+                print(z_in.shape)
+
+                # Don't pass through if no inputs.
+                if len(z_in) != 0:
+                    pz = self.networks[dim](z_in)
+                    mu, sigma = pz.mean, pz.stddev
+                    print(mu.shape)
+                    mu = mu.reshape(z_in_shape)
+                    sigma = sigma.reshape(z_in_shape)
+                    print(mu.shape, z_dim.shape, np_1.shape)
+                    np_1[idx, dim, :] = mu / sigma ** 2
+                    np_2[idx, dim, :] = - 1. / (2. * sigma ** 2)
+            else:
+                z_in = z_dim.unsqueeze(1)
+                pz = self.networks[dim](z_in)
+                mu, sigma = pz.mean, pz.stddev
+                np_1[:, dim, :] = mu / sigma ** 2
+                np_2[:, dim, :] = -1. / (2. * sigma ** 2)
+
+        # Sum natural parameters.
+        np_1 = torch.sum(np_1, 1)
+        np_2 = torch.sum(np_2, 1)
+        sigma = (- 1. / (2. * np_2)) ** 0.5
+        mu = np_1 * sigma ** 2.
+
+        pz = Normal(mu, sigma)
+
+        return pz
+
+    def forward(self, z, mask=None):
+        """Returns parameters of a diagonal Gaussian distribution."""
+       
+        # reshape z
+        z_shape = z.shape
+        z = z.reshape(-1, z.shape[2])       
+       
+        np_1 = torch.zeros(z.shape[0], z.shape[1], self.out_dim)
+        np_2 = torch.zeros_like(np_1)
+
+        # Pass through individual networks.
+        for dim, z_dim in enumerate(z.transpose(0, 1)):
+            if mask is not None:
+                idx = torch.where(mask[:, dim])[0]
+                z_in = z_dim[idx].unsqueeze(1)
+
+                # Don't pass through if no inputs.
+                if len(z_in) != 0:
+                    pz = self.networks[dim](z_in)
+                    mu, sigma = pz.mean, pz.stddev
+                    np_1[idx, dim, :] = mu / sigma ** 2
+                    np_2[idx, dim, :] = - 1. / (2. * sigma ** 2)
+            else:
+                z_in = z_dim.unsqueeze(1)
+                pz = self.networks[dim](z_in)
+                mu, sigma = pz.mean, pz.stddev
+                np_1[:, dim, :] = mu / sigma ** 2
+                np_2[:, dim, :] = -1. / (2. * sigma ** 2)
+
+            assert not torch.isnan(sigma).any(), print('sigma', sigma)
+
+        # Sum natural parameters.
+        epsilon = 1e-1
+        np_1 = torch.sum(np_1, 1)
+        np_2 = torch.sum(np_2, 1) + epsilon
+        sigma = torch.clip(- 1. / (2. * np_2),min = 0.01) ** 0.5
+        mu = np_1 * sigma ** 2.
+
+        assert not (np_2==0).any(), print('np is 0', np_2)
+        assert not torch.isnan(np_2).any(), print('np', np_2)
+
+        assert not torch.isnan(sigma).any(), print('sigma is nan', sigma, np_2)
+        assert not torch.isnan(np_2).any(), print('np', np_2)
+
+        mu = mu.reshape((z_shape[0], z_shape[1], -1))
+        sigma = sigma.reshape((z_shape[0], z_shape[1], -1))
+
+        pz = Normal(mu, sigma)
+
+        return pz
+
+
+class IndexNet(nn.Module):
+    """IndexNet from Sparse Gaussian Process Variational Autoencoders.
+
+    :param in_dim (int): dimension of the input variable.
+    :param out_dim (int): dimension of the output variable.
+    :param inter_dim (int): dimension of intermediate representation.
+    :param h_dims (list, optional): dimension of the encoding function.
+    :param rho_dims (list, optional): dimension of the shared function.
+    :param min_sigma (float, optional): sets the minimum output sigma.
+    :param init_sigma (float, optional): sets the initial output sigma.
+    :param nonlinearity (function, optional): non-linearity to apply in
+    between layers.
+    """
+    def __init__(self, input_size, z_size, hidden_sizes=(128, 128, 128),
+                 min_sigma=1e-3, init_sigma=None,
+                 nonlinearity=F.relu):
+        super().__init__()
+
+        self.out_dim = z_size
+        self.inter_dim = hidden_sizes[0]
+
+        # A network for each dimension.
+        self.networks = nn.ModuleList()
+        for _ in range(3):
+            self.networks.append(LinearNN(1, self.inter_dim, hidden_sizes, nonlinearity))
+
+        # Takes the aggregation of the outputs from self.networks.
+        self.rho = nn.ModuleList()
+        for _ in range(3):
+            self.rho.append(LinearNN(1, self.inter_dim, hidden_sizes, nonlinearity))
+
+    def forward(self, x, mask=None):
+        """Returns parameters of a diagonal Gaussian distribution."""
+        out = torch.zeros(x.shape[0], x.shape[1], self.inter_dim)
+
+        # Pass through individual networks.
+        for dim, z_dim in enumerate(x.transpose(0, 1)):
+            if mask is not None:
+                idx = torch.where(mask[:, dim])[0]
+                z_in = z_dim[idx].unsqueeze(1)
+
+                # Don't pass through if no inputs.
+                if len(z_in) != 0:
+                    z_out = self.networks[dim](z_in)
+                    out[idx, dim, :] = z_out
+
+            else:
+                z_in = z_dim.unsqueeze(1)
+                z_out = self.networks[dim](z_in)
+                out[:, dim, :] = z_out
+
+        # Aggregation layer.
+        out = torch.sum(out, 1)
+
+        # Pass through shared network.
+        pz = self.rho(out)
+
+        return pz
