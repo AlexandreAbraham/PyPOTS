@@ -220,7 +220,7 @@ class BackboneGP_VAE(nn.Module):
         """
         qz_x_ori = self.encode(X_ori)
 
-        loss = (qz_x.mean.detach().cpu() - qz_x_ori.mean.detach().cpu()).pow(2) / (qz_x.variance / qz_x_ori.variance.detach().cpu())
+        loss = (qz_x.mean.detach() - qz_x_ori.mean.detach()).pow(2) / (qz_x.variance / qz_x_ori.variance.detach())
 
         mask_imputed_coords = (missing_mask != missing_mask_ori).sum(axis=2) != 0
 
@@ -240,7 +240,7 @@ class BackboneGP_VAE(nn.Module):
         # For each sample, compute the log prob of its embedding mean belonging to qz_x
         for x_sampled in X_sampled:
             qz_x_sampled = self.encode(x_sampled)
-            loss -= qz_x_sampled.log_prob(qz_x.rsample().detach().cpu())
+            loss -= qz_x_sampled.log_prob(qz_x.rsample().detach())
 
         return 100 * loss / len(qz_x.mean.flatten())
 
