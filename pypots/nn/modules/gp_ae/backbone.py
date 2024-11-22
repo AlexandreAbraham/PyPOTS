@@ -139,10 +139,26 @@ class BackboneGP_VAE(nn.Module):
         for i in range(batch_size):
 
             mask_diff = (missing_mask[i::batch_size,1:] * missing_mask[i::batch_size,:-1])
-            X_diff = ((X[i::batch_size,1:] - X[i::batch_size,-1:])*mask_diff).pow(2).sum(2) / mask_diff.sum(2)
-            temporal_loss += (z[i::batch_size,1:] - z[i::batch_size,:-1]).pow(2).sum(2) / (X_diff + eps)
+            mask_diff_sum = mask_diff.sum(2)
+            mask_diff_sum[mask_diff_sum==0] = 1
+            X_diff = ((X[i::batch_size,1:] - X[i::batch_size,-1:])*mask_diff).pow(2).sum(2) / mask_diff_sum
+            z_diff = (z[i::batch_size,1:] - z[i::batch_size,:-1]).pow(2).sum(2)
+            temporal_loss += z_diff / (X_diff + eps)
 
-            return temporal_loss.mean()            
+            #print(temporal_loss)
+            #print(X_diff)
+            if torch.isnan(temporal_loss).any():
+                print(mask_diff.sum(2))
+                print(temporal_loss[temporal_loss!=temporal_loss], (z_diff / (X_diff + eps))[temporal_loss!=temporal_loss])
+                print(z_diff[temporal_loss!=temporal_loss], X_diff[temporal_loss!=temporal_loss])
+
+            assert not torch.isnan(temporal_loss).any(), print(temporal_loss[temporal_loss!=temporal_loss], (z_diff / (X_diff + eps))[temporal_loss!=temporal_loss])
+
+            assert not torch.isnan(temporal_loss).any(), print(z_diff[temporal_loss!=temporal_loss], z_diff[temporal_loss!=temporal_loss])
+
+        #print(temporal_loss.mean())
+
+        return temporal_loss.mean()            
 
     # Modified forward function
     def forward(self, X, missing_mask):
@@ -184,7 +200,7 @@ class BackboneGP_VAE(nn.Module):
         dependence_loss, sigma = HSIC_loss(qz_x.variance[::(self.K * self.M)], missing_mask[::(self.K * self.M)])
 
         # get final elbo
-        elbo = -nll - self.beta * kl - temporal_loss  #- dependence_loss * 10000
+        elbo = -nll - self.beta * kl - temporal_loss * .01  #- dependence_loss * 10000
         elbo = elbo.mean()
 
         #print('time end', time.time() - t)

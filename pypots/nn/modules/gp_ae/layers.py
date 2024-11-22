@@ -197,12 +197,12 @@ class GpvaeEncoder(nn.Module):
 
         # Compute mean and log variance
         mu = self.mu_layer(mapped)
-        logvar = self.logvar_layer(mapped)
+        logvar = self.logvar_layer(mapped).clip(min = 1e-2)
         #print(f"Mu shape: {mu.size()}")       # Should be [batch_size * time_length, z_size]
         #print(f"Logvar shape: {logvar.size()}")  # Should be [batch_size * time_length, z_size]
 
         # Compute standard deviation
-        std = torch.exp(0.5 * logvar).clip(min = 1e-2)
+        std = torch.exp(0.5 * logvar)
         #print(f"Std shape before reshape: {std.size()}")  # Should be [batch_size * time_length, z_size]
 
         # Reshape tensors back to [batch_size, time_length, z_size]
