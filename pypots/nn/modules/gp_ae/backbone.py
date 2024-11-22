@@ -369,7 +369,7 @@ class BackboneGP_VAE(nn.Module):
         assert not (elbo > 50), print('elbo negative', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item())
 
         if len(self.loss_history['elbo']) % 100 == 0:
-            self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach().cpu(), X.detach().cpu(), self.latent_dim, time_steps, -elbo, kl, tl)
+            self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach(), X.detach(), self.latent_dim, time_steps, -elbo, kl, tl)
 
     def plot_losses(self):
         # Calculate the step size n to ensure we have a maximum of 500 points plotted
