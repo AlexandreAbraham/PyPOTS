@@ -108,6 +108,7 @@ class BackboneGP_VAE(nn.Module):
         self.p = .5
 
         self.sampling = False
+        self.train_decoder = True
 
     # for tracking
         self.loss_history = {
@@ -131,6 +132,18 @@ class BackboneGP_VAE(nn.Module):
     def kl_divergence(q_dist, p_dist):
         return torch.distributions.kl_divergence(q_dist, p_dist)
 
+    def temporal_loss(self, z, X, missing_mask, batch_size, eps = 1e-3):
+
+        temporal_loss = 0
+
+        for i in range(batch_size):
+
+            mask_diff = (missing_mask[i::batch_size,1:] * missing_mask[i::batch_size,:-1])
+            X_diff = ((X[i::batch_size,1:] - X[i::batch_size,-1:])*mask_diff).pow(2).sum(2) / mask_diff.sum(2)
+            temporal_loss += (z[i::batch_size,1:] - z[i::batch_size,:-1]).pow(2).sum(2) / (X_diff + eps)
+
+            return temporal_loss.mean()            
+
     # Modified forward function
     def forward(self, X, missing_mask):
 
@@ -139,6 +152,8 @@ class BackboneGP_VAE(nn.Module):
         batch_size, time_steps, _ = X.size()
         # Merge prepare_data and simulate_missing_data
         X_ori, missing_mask_ori, X, missing_mask = self.prepare_and_simulate(X, missing_mask)
+        
+        # compute masks
         missing_mask = (X!=0)
         missing_mask_ori = (X_ori!=0)
         # get indicating mask of where data has been artificially removed
@@ -148,44 +163,28 @@ class BackboneGP_VAE(nn.Module):
         qz_x = self.encode(X, missing_mask)
         z = qz_x.rsample()
 
-        #missing_mask[:,::2,1::2] = 1
-        #z = qz_x.mean
-
         # Decode to get likelihood p(x|z)
         px_z = self.decode(z)
 
+        # compute reconstruction error
         nll, nll_recon, nll_imputation, nll_sampling = self.reconstruction_error(qz_x, px_z, X, X_ori, missing_mask, missing_mask_ori, indicating_mask)
 
         ## Compute KL divergence between q(z|x) and p(z) : Here the imposed prior is only on the variance
 
-        # Compute the number" of missing values per sample per time step
-        missing_ratio = missing_mask.float().mean(dim=2)  # Shape: (batch_size * K * M, time_steps)
-        prior_scale = 1./(1 + (1 - missing_ratio)) # this will be changed to something smarter later on
-
-        # The prior on the variance forces the  mean variance to be proportional to the amount of missing
-        # data for the observed point
-        #kl = ( qz_x.variance.mean(2) - prior_scale).pow(2).sum(1).pow(.5)
         kl = qz_x.mean.pow(2).sum(2).pow(.5).mean()
         kl = kl.sum()
+
         #kl += -torch.log(qz_x.variance.abs().mean())/50
 
         ## Compute a loss based on a Gaussian process prior between 1 point and the next
-        # basically z_{t+1} ~N(z_t, sigma^2)
-        #sigma = qz_x.variance.mean().pow(.5) * 5 # this will also be changed to something smarter
-        sigma = 1
-        mask_diff = (missing_mask[:,1:] * missing_mask[:,:-1])
-        #print(X.shape, z.shape, missing_mask.shape, mask_diff.shape, (X[:,1:] - X[:,-1:]).shape)
-        X_diff = ((X[:,1:] - X[:,-1:])*mask_diff).pow(2).sum(2) / mask_diff.sum(2)
-        eps = 1e-3
-        temporal_loss = (z[:,1:] - z[:,:-1]).pow(2).sum(2) / (X_diff + eps)
-        temporal_loss = temporal_loss.mean()
+        temporal_loss = self.temporal_loss(z, X, missing_mask, batch_size)
 
         # get dependence loss between variance and missingness patterns
         sigma = np.exp(np.random.uniform(-8,5))
         dependence_loss, sigma = HSIC_loss(qz_x.variance[::(self.K * self.M)], missing_mask[::(self.K * self.M)])
 
         # get final elbo
-        elbo = -nll - self.beta * kl #- temporal_loss  #- dependence_loss * 10000
+        elbo = -nll - self.beta * kl - temporal_loss  #- dependence_loss * 10000
         elbo = elbo.mean()
 
         #print('time end', time.time() - t)
@@ -208,18 +207,36 @@ class BackboneGP_VAE(nn.Module):
 
         return -elbo
 
-    def latent_imputation_error(self, qz_x, X_ori):
+    def latent_imputation_error(self, qz_x, X_ori, missing_mask, missing_mask_ori):
         """
         Loss that forces qz_x to contain X_ori
         """
 
         qz_x_ori = self.encode(X_ori)
 
-        loss = -qz_x.log_prob(qz_x_ori.mean.detach())
+        qz_x_normalized = torch.distributions.Normal(loc = qz_x.mean, scale = qz_x.stddev / qz_x_ori.stddev.detach())
+
+        #qz_x.variance = qz_x.variance / qz_x_ori.variance.detach() ##normalize by other variance !!
+
+        loss = (qz_x.mean.detach() - qz_x_ori.mean.detach()).pow(2) / (qz_x.variance / qz_x_ori.variance.detach())
+
+        #loss = -qz_x_normalized.log_prob(qz_x_ori.mean.detach())
+        mask_imputed_coords = (missing_mask != missing_mask_ori).sum(axis=2)!=0
+        loss = torch.clamp(loss, min = -10)#[mask_imputed_coords]
+        #loss = -qz_x.log_prob(qz_x_ori.mean.detach())
+
+        ## ponderer la loss par le nombre de valeurs manquantes
+
+        #nb_missing_vals = missing_mask.sum(axis=2)#.unsqueeze(2)
+        #print(nb_missing_vals.shape, missing_mask.shape, loss.shape)
+        #loss = loss * nb_missing_vals / nb_missing_vals
+
+
+        #loss = loss * loss.abs() # make square
 
         #print(loss.mean(), qz_x.variance.mean())
 
-        return loss/100
+        return loss * 10 #* len(loss) * .001 #/100 #normalization trick just to compensate for la ponderation par le nb de vals manquantes
 
     def latent_sampling_error(self, qz_x, X_sampled):
         """
@@ -263,11 +280,9 @@ class BackboneGP_VAE(nn.Module):
     def reconstruction_error(self, qz_x, px_z, X, X_ori, missing_mask, missing_mask_ori, indicating_mask):
 
         # Negative log-likelihood
-        nll_recon = self.compute_nll(px_z, X, missing_mask) #reconstruction error
-        nll_recon += self.compute_nll(px_z, X_ori, indicating_mask, keep_best = False) #imputation error
-        #nll_recon = torch.tensor(0.01)
-        #nll_imputation = self.compute_nll(px_z, X_ori, indicating_mask, keep_best = False) #imputation error
-        nll_imputation = self.latent_imputation_error(qz_x, X_ori)
+        nll_recon = self.compute_nll(px_z, X_ori, missing_mask_ori, keep_best = False)
+
+        nll_imputation = self.latent_imputation_error(qz_x, X_ori, missing_mask, missing_mask_ori)
 
         if self.sampling and False:
             num_samples = 1
@@ -280,14 +295,12 @@ class BackboneGP_VAE(nn.Module):
         else:
             nll_sampling = torch.tensor(1).float()
 
-        #print(nll_sampling)
+        #if not self.train_decoder:
+        #    self.p = self.temperature * .5
+        #self.p = .3
 
-        #alpha = .01 #self.temperature * .5
-        #if self.p <= .01:
-            #alpha = 0.001
         alpha = self.p
         nll = nll_recon * (1 - alpha) + nll_imputation * alpha/2 + nll_sampling * alpha/2
-
 
         return nll, nll_recon, nll_imputation, nll_sampling
 
@@ -432,7 +445,7 @@ class BackboneGP_VAE(nn.Module):
 
         return distances
 
-    def compute_nll_(self, px_z, X, mask, keep_best = False):
+    def compute_nll(self, px_z, X, mask, keep_best = False):
         """
         Compute the negative log-likelihood. If we are dealing with imputation we set keep_best is true, and we only get 
         the loss on the closest element within each of the K x M samples for each observation 
@@ -455,9 +468,9 @@ class BackboneGP_VAE(nn.Module):
             #print(nll)
             return nll.sum()
         else:
-            return torch.tensor(mask.shape).prod() * nll.sum(dim=(1, 2)) / mask.sum()
+            return (torch.tensor(mask.shape).prod() * nll.sum(dim=(1, 2)) / mask.sum()).mean()
 
-    def compute_nll(self, px_z, X, mask, keep_best = False):
+    def compute_nll_(self, px_z, X, mask, keep_best = False):
 
         mse = (X - px_z.mean).pow(2)
         return mse[mask].float().mean()
@@ -547,12 +560,13 @@ class BackboneGP_VAE(nn.Module):
         """
 
         # Convert to CPU numpy arrays for plotting
-        z_mean = z.mean(dim=0).detach().cpu().numpy()  # Shape: [time_steps, latent_dim]
         z_mean = z[0].detach().cpu().numpy()
         z_var = qz_x.variance[0].detach().cpu().numpy()
 
         X_ori_np = torch.clone(X_ori).detach().cpu().numpy()
         X_np = X.detach().cpu().numpy()
+
+        z_mean_ori = self.encode(X_ori).mean.detach()
 
         # Sample 10 times from the posterior to get 10 reconstructions
         reconstructions = []
@@ -578,11 +592,17 @@ class BackboneGP_VAE(nn.Module):
         # Plot all latent dimensions' mean and variance
         plt.figure(figsize=(15, 12))
 
+        plt.subplot(4, 1, 4)
+        log_prob = qz_x
+        plt.plot(qz_x.log_prob(z_mean_ori)[0].detach())
+        plt.title('Log proba of z original belonging to the z corrupted gaussian')
+
         losses = f'kl = {kl.mean().item()} - nll = {nll.mean().item()} - temporal {tl.item()}'
         plt.subplot(4, 1, 1)
         for dim in range(latent_dim):
             plt.plot(range(time_steps), z_mean[:, dim], label=f'Latent dim {dim} Mean')
             plt.fill_between(range(time_steps), z_mean[:, dim] - z_var[:, dim]**.5, z_mean[:, dim] + z_var[:, dim]**.5, alpha=0.2)
+            plt.scatter(range(time_steps), z_mean_ori[0][:, dim], label=f'Latent dim {dim} Mean')
 
         plt.title('Latent Time Series (Mean and Variance) ' + losses)
         plt.xlabel('Time Steps')
@@ -597,6 +617,8 @@ class BackboneGP_VAE(nn.Module):
         plt.semilogy(np.linalg.norm(z_var, axis=1), 'r:', label='Posterior scale')
         plt.semilogy(z_var, alpha = .5)
         plt.legend()
+
+        
 
         # Plot original vs reconstructed data for all 10 reconstructions
         plt.subplot(4, 1, 3)
@@ -660,3 +682,33 @@ def centering_matrix(n, device):
     ones = torch.ones(n, n).to(device) / n
     H = I - ones
     return H
+
+def compute_kl_divergence(qz_x, prior_variance=0.1):
+    """
+    Computes the KL divergence between the approximate posterior q(z|x)
+    and the prior p(z) with a specified variance.
+    """
+    # qz_x.mean and qz_x.variance should be tensors of shape [batch_size, latent_dim]
+
+    mu_q = qz_x.mean  # Mean of q(z|x)
+    sigma_q2 = qz_x.variance  # Variance of q(z|x); ensure this is variance, not std dev
+
+    # Prior parameters
+    mu_p = torch.zeros_like(mu_q)  # Prior mean is zero
+    sigma_p2 = prior_variance  # Prior variance is 0.1
+
+    # Compute the KL divergence components
+    # Avoid division by zero by adding a small epsilon if necessary
+    eps = 1e-8
+    sigma_q2 = sigma_q2 + eps
+
+    term1 = sigma_q2 / sigma_p2  # (σ_q^2) / (σ_p^2)
+    term2 = (mu_q - mu_p).pow(2) / sigma_p2  # (μ_q - μ_p)^2 / (σ_p^2)
+    term3 = -1  # -1
+    term4 = torch.log(sigma_p2 / sigma_q2)  # ln(σ_p^2 / σ_q^2)
+
+    # Sum over the latent dimensions
+    kl_div = 0.5 * torch.sum(term1 + term2 + term3 + term4, dim=1)  # [batch_size]
+
+    # Return the mean KL divergence over the batch
+    return kl_div.mean()

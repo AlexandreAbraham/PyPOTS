@@ -202,7 +202,7 @@ class GpvaeEncoder(nn.Module):
         #print(f"Logvar shape: {logvar.size()}")  # Should be [batch_size * time_length, z_size]
 
         # Compute standard deviation
-        std = torch.exp(0.5 * logvar)
+        std = torch.exp(0.5 * logvar).clip(min = 1e-2)
         #print(f"Std shape before reshape: {std.size()}")  # Should be [batch_size * time_length, z_size]
 
         # Reshape tensors back to [batch_size, time_length, z_size]
@@ -211,6 +211,7 @@ class GpvaeEncoder(nn.Module):
         #print(f"Mu shape after reshape: {mu.size()}")     # [batch_size, time_length, z_size]
         #print(f"Std shape after reshape: {std.size()}")   # [batch_size, time_length, z_size]
 
+        #std = torch.ones(std.shape) * .1
         # Create Normal distribution
         z_dist = torch.distributions.Normal(loc=mu, scale=std)
         # Make it an Independent distribution over the last dimension (latent dimension)
