@@ -88,6 +88,7 @@ class BackboneGP_VAE(nn.Module):
         self.time_length = time_length
         self.latent_dim = latent_dim
         self.beta = beta
+        self.gamma = .01
         self.encoder = GpvaeEncoder(input_dim, latent_dim, encoder_sizes)
         #self.encoder = FactorNet(input_dim, latent_dim, encoder_sizes)
         self.decoder = GpvaeDecoder(latent_dim, input_dim, decoder_sizes)
@@ -141,9 +142,14 @@ class BackboneGP_VAE(nn.Module):
             mask_diff = (missing_mask[i::batch_size,1:] * missing_mask[i::batch_size,:-1])
             mask_diff_sum = mask_diff.sum(2)
             mask_diff_sum[mask_diff_sum==0] = 1
-            X_diff = ((X[i::batch_size,1:] - X[i::batch_size,-1:])*mask_diff).pow(2).sum(2) / mask_diff_sum
+            X_diff = ((X[i::batch_size,1:] - X[i::batch_size,:-1])*mask_diff).pow(2).sum(2) / mask_diff_sum
             z_diff = (z[i::batch_size,1:] - z[i::batch_size,:-1]).pow(2).sum(2)
             temporal_loss += z_diff / (X_diff + eps)
+
+            #print(X[missing_mask], 'oo')
+
+            #print(X_diff[mask_diff], X[1:][mask_diff])
+            #print(X[mask_diff], )
 
             #print(temporal_loss)
             #print(X_diff)
@@ -200,7 +206,7 @@ class BackboneGP_VAE(nn.Module):
         dependence_loss, sigma = HSIC_loss(qz_x.variance[::(self.K * self.M)], missing_mask[::(self.K * self.M)])
 
         # get final elbo
-        elbo = -nll - self.beta * kl - temporal_loss * .01  #- dependence_loss * 10000
+        elbo = -nll - self.beta * kl - temporal_loss * self.gamma  #- dependence_loss * 10000
         elbo = elbo.mean()
 
         #print('time end', time.time() - t)
@@ -223,14 +229,14 @@ class BackboneGP_VAE(nn.Module):
 
         return -elbo
 
-    def latent_imputation_error(self, qz_x, X_ori, missing_mask, missing_mask_ori):
+    def latent_imputation_error(self, qz_x, X_ori, missing_mask, missing_mask_ori, for_plotting=False):
         """
         Loss that forces qz_x to contain X_ori
         """
 
         qz_x_ori = self.encode(X_ori)
 
-        qz_x_normalized = torch.distributions.Normal(loc = qz_x.mean, scale = qz_x.stddev / qz_x_ori.stddev.detach())
+        #qz_x_normalized = torch.distributions.Normal(loc = qz_x.mean, scale = qz_x.stddev / qz_x_ori.stddev.detach())
 
         #qz_x.variance = qz_x.variance / qz_x_ori.variance.detach() ##normalize by other variance !!
 
@@ -238,21 +244,28 @@ class BackboneGP_VAE(nn.Module):
 
         #loss = -qz_x_normalized.log_prob(qz_x_ori.mean.detach())
         mask_imputed_coords = (missing_mask != missing_mask_ori).sum(axis=2)!=0
-        loss = torch.clamp(loss, min = -10)#[mask_imputed_coords]
+        #loss = torch.clamp(loss, min = -10)
+        
+        if not for_plotting:
+            loss = loss[mask_imputed_coords]
+        else:
+            print('mean of mask of imputed coords :', mask_imputed_coords.float().mean())
         #loss = -qz_x.log_prob(qz_x_ori.mean.detach())
 
         ## ponderer la loss par le nombre de valeurs manquantes
 
-        #nb_missing_vals = missing_mask.sum(axis=2)#.unsqueeze(2)
+        #nb_missing_vals = missing_mask.sum(axis=2).unsqueeze(2)
         #print(nb_missing_vals.shape, missing_mask.shape, loss.shape)
         #loss = loss * nb_missing_vals / nb_missing_vals
+        #loss = loss * len(loss)
+        #print(loss.mean(), loss.shape)
 
 
         #loss = loss * loss.abs() # make square
 
         #print(loss.mean(), qz_x.variance.mean())
 
-        return loss * 10 #* len(loss) * .001 #/100 #normalization trick just to compensate for la ponderation par le nb de vals manquantes
+        return loss * len(mask_imputed_coords.flatten()) * 100 #* len(loss) * .001 #/100 #normalization trick just to compensate for la ponderation par le nb de vals manquantes
 
     def latent_sampling_error(self, qz_x, X_sampled):
         """
@@ -576,7 +589,7 @@ class BackboneGP_VAE(nn.Module):
         """
 
         # Convert to CPU numpy arrays for plotting
-        z_mean = z[0].detach().cpu().numpy()
+        z_mean = qz_x.mean[0].detach().cpu().numpy()
         z_var = qz_x.variance[0].detach().cpu().numpy()
 
         X_ori_np = torch.clone(X_ori).detach().cpu().numpy()
@@ -610,7 +623,10 @@ class BackboneGP_VAE(nn.Module):
 
         plt.subplot(4, 1, 4)
         log_prob = qz_x
-        plt.plot(qz_x.log_prob(z_mean_ori)[0].detach())
+        #plt.plot(qz_x.log_prob(z_mean_ori)[0].detach())
+        mask, mask_ori = (X!=0), (X_ori!=0)
+        plt.plot(self.latent_imputation_error(qz_x, X_ori, mask, mask_ori, for_plotting=True)[0].detach())
+
         plt.title('Log proba of z original belonging to the z corrupted gaussian')
 
         losses = f'kl = {kl.mean().item()} - nll = {nll.mean().item()} - temporal {tl.item()}'
@@ -629,9 +645,12 @@ class BackboneGP_VAE(nn.Module):
         nb_missing_vals = (X_np[0] == 0).sum(axis=1)
         missing_ratio = (X_np[0] != 0).mean(axis=1)
         prior_scale = (1 - missing_ratio) ** 0.5
+        plt.semilogy(z_var, alpha = .5)
+        # plt errors
+        plt.semilogy((z_mean - z_mean_ori[0].numpy())**2, alpha = .5)
+
         plt.semilogy(prior_scale, label='Prior scale')
         plt.semilogy(np.linalg.norm(z_var, axis=1), 'r:', label='Posterior scale')
-        plt.semilogy(z_var, alpha = .5)
         plt.legend()
 
         
