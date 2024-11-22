@@ -443,7 +443,9 @@ class BackboneGP_VAE(nn.Module):
 
         plt.subplot(4, 1, 4)
         mask, mask_ori = (X != 0).to(self.device), (X_ori != 0).to(self.device)
-        plt.plot(self.latent_imputation_error(qz_x, X_ori, mask, mask_ori, for_plotting=True)[0].detach().cpu())
+        imputation_error = self.latent_imputation_error(qz_x, X_ori, mask, mask_ori, for_plotting=True)[0].detach().cpu()
+        print(imputation_error.shape)
+        plt.plot(imputation_error)
         plt.title('Log probability of original z belonging to the corrupted Gaussian')
 
         losses = f'kl = {kl.mean().item()} - nll = {nll.mean().item()} - temporal {tl.item()}'
