@@ -149,6 +149,7 @@ class GP_VAE(BaseNNImputer):
             saving_path,
             model_saving_strategy,
             verbose,
+            device = 'cpu'
         )
         available_kernel_type = ["cauchy", "diffusion", "rbf", "matern"]
         assert kernel in available_kernel_type, f"kernel should be one of {available_kernel_type}, but got {kernel}"
@@ -188,6 +189,8 @@ class GP_VAE(BaseNNImputer):
         # set up the optimizer
         self.optimizer = optimizer
         self.optimizer.init_optimizer(self.model.parameters())
+
+        model.backbone.to(device)
 
         # set gp
         self.gp = ProbabilisticGP(self.model.backbone, assemble_data = self._assemble_input_for_training)
