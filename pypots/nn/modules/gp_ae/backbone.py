@@ -220,7 +220,7 @@ class BackboneGP_VAE(nn.Module):
         """
         qz_x_ori = self.encode(X_ori)
 
-        loss = (qz_x.mean.detach() - qz_x_ori.mean.detach()).pow(2) / (qz_x.variance / qz_x_ori.variance.detach())
+        loss = (qz_x.mean.detach().cpu() - qz_x_ori.mean.detach().cpu()).pow(2) / (qz_x.variance / qz_x_ori.variance.detach().cpu())
 
         mask_imputed_coords = (missing_mask != missing_mask_ori).sum(axis=2) != 0
 
@@ -240,7 +240,7 @@ class BackboneGP_VAE(nn.Module):
         # For each sample, compute the log prob of its embedding mean belonging to qz_x
         for x_sampled in X_sampled:
             qz_x_sampled = self.encode(x_sampled)
-            loss -= qz_x_sampled.log_prob(qz_x.rsample().detach())
+            loss -= qz_x_sampled.log_prob(qz_x.rsample().detach().cpu())
 
         return 100 * loss / len(qz_x.mean.flatten())
 
@@ -369,7 +369,7 @@ class BackboneGP_VAE(nn.Module):
         assert not (elbo > 50), print('elbo negative', elbo.item(), nll_recon.mean().item(), nll_imputation.mean().item(), kl.mean().item())
 
         if len(self.loss_history['elbo']) % 100 == 0:
-            self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach(), X.detach(), self.latent_dim, time_steps, -elbo, kl, tl)
+            self.plot_latent_series_and_reconstruction(z, px_z, qz_x, X_ori.detach().cpu(), X.detach().cpu(), self.latent_dim, time_steps, -elbo, kl, tl)
 
     def plot_losses(self):
         # Calculate the step size n to ensure we have a maximum of 500 points plotted
@@ -415,7 +415,7 @@ class BackboneGP_VAE(nn.Module):
         X_ori_np = torch.clone(X_ori).detach().cpu().numpy()
         X_np = X.detach().cpu().numpy()
 
-        z_mean_ori = self.encode(X_ori).mean.detach()
+        z_mean_ori = self.encode(X_ori).mean.detach().cpu()
 
         # Sample 10 times from the posterior to get 10 reconstructions
         reconstructions = []
@@ -443,7 +443,7 @@ class BackboneGP_VAE(nn.Module):
 
         plt.subplot(4, 1, 4)
         mask, mask_ori = (X != 0), (X_ori != 0)
-        plt.plot(self.latent_imputation_error(qz_x, X_ori, mask, mask_ori, for_plotting=True)[0].detach())
+        plt.plot(self.latent_imputation_error(qz_x, X_ori, mask, mask_ori, for_plotting=True)[0].detach().cpu())
         plt.title('Log probability of original z belonging to the corrupted Gaussian')
 
         losses = f'kl = {kl.mean().item()} - nll = {nll.mean().item()} - temporal {tl.item()}'
