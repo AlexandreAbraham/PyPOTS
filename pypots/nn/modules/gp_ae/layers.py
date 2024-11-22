@@ -170,13 +170,14 @@ def make_fc(input_size, output_size, hidden_sizes):
 
     return net
 class GpvaeEncoder(nn.Module):
-    def __init__(self, input_size, z_size, hidden_sizes=(128, 128, 128)):
+    def __init__(self, input_size, z_size, hidden_sizes=(128, 128, 128), device = None):
         super().__init__()
         self.z_size = int(z_size)
         self.input_size = input_size
         self.net, self.mu_layer, self.logvar_layer = make_fc(
             input_size*2, (z_size, z_size), hidden_sizes
         )
+        self.device = device
 
 
 
@@ -188,7 +189,7 @@ class GpvaeEncoder(nn.Module):
         # Reshape input to [batch_size * time_length, input_size]
         x_reshaped = torch.clone(x.view(batch_size * time_length, input_size))
         mask = (x_reshaped!=0)
-        x_reshaped[~mask] = torch.rand(size = x_reshaped[~mask].shape)
+        x_reshaped[~mask] = torch.rand(size = x_reshaped[~mask].shape).to(self.device)
         x_concat = torch.cat((x_reshaped,mask), dim = 1)
         #print(f"Reshaped input: {x_reshaped.size()}")  # Debug
 
