@@ -148,8 +148,7 @@ class GP_VAE(BaseNNImputer):
             device,
             saving_path,
             model_saving_strategy,
-            verbose,
-            device = 'cpu'
+            verbose
         )
         available_kernel_type = ["cauchy", "diffusion", "rbf", "matern"]
         assert kernel in available_kernel_type, f"kernel should be one of {available_kernel_type}, but got {kernel}"
@@ -166,6 +165,7 @@ class GP_VAE(BaseNNImputer):
         self.sigma = sigma
         self.length_scale = length_scale
         self.kernel_scales = kernel_scales
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # set up the model
         self.model = _GP_VAE(
@@ -190,7 +190,7 @@ class GP_VAE(BaseNNImputer):
         self.optimizer = optimizer
         self.optimizer.init_optimizer(self.model.parameters())
 
-        model.backbone.to(device)
+        self.model.backbone.to(device)
 
         # set gp
         self.gp = ProbabilisticGP(self.model.backbone, assemble_data = self._assemble_input_for_training)
