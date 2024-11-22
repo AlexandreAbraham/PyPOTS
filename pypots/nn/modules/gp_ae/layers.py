@@ -188,7 +188,7 @@ class GpvaeEncoder(nn.Module):
 
         # Reshape input to [batch_size * time_length, input_size]
         x_reshaped = torch.clone(x.view(batch_size * time_length, input_size))
-        mask = (x_reshaped!=0)
+        mask = (x_reshaped!=0).to(self.device)
         x_reshaped[~mask] = torch.rand(size = x_reshaped[~mask].shape).to(self.device)
         x_concat = torch.cat((x_reshaped,mask), dim = 1)
         #print(f"Reshaped input: {x_reshaped.size()}")  # Debug
