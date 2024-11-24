@@ -327,13 +327,16 @@ class GpvaeEncoder_cnn2(nn.Module):
         super().__init__()
         self.z_size = int(z_size)
         self.input_size = input_size
-        print('input:', input_size)
-        self.net = nn.Sequential(
-            nn.Conv1d(input_size[1], hidden_sizes[0], kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(hidden_sizes[0], hidden_sizes[1], kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
+
+        sizes = [input_size[1]] + hidden_sizes
+
+        layers = []
+        for i in range(len(sizes) - 1):
+            layer = nn.Conv1d(sizes[i], sizes[i+1], kernel_size=3, padding=1)
+            relu = nn.ReLU()
+            layers.extend([layer, relu])
+        
+        self.net = nn.Sequential(*layers)
         encoder_dim = hidden_sizes[1]
         self.mu_layer = nn.Linear(encoder_dim, z_size)
         self.logvar_layer = nn.Linear(encoder_dim, z_size)
@@ -387,11 +390,17 @@ class GpvaeDecoder_cnn2(nn.Module):
             nn.Linear(latent_dim, hidden_sizes[0]),
             nn.ReLU(),
         )
-        self.decoder_cnn = nn.Sequential(
-            nn.ConvTranspose1d(hidden_sizes[0], hidden_sizes[1], kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose1d(hidden_sizes[1], input_size[1], kernel_size=3, padding=1),
-        )
+        
+        sizes = hidden_sizes + [input_size[1]]
+        
+        layers = []
+        for i in range(len(sizes) - 1):
+            layer = nn.ConvTranspose1d(sizes[i], sizes[i+1], kernel_size=3, padding=1)
+            relu = nn.ReLU()
+            layers.extend([layer, relu])
+        layers = layers[:-1]  # We do not need the last relu
+        
+        self.decoder_cnn = nn.Sequential(*layers)
 
     def forward(self, z, mask=None):
         x = self.decoder_fc(z)  # Shape: (batch_size, time_points, 64)
@@ -400,7 +409,6 @@ class GpvaeDecoder_cnn2(nn.Module):
         x = x.permute(0, 2, 1)  # Shape: (batch_size, time_points, input_channels)
         var = torch.ones_like(x).type(torch.float)*.5
         return torch.distributions.Normal(x, var)
-
 
 
 
